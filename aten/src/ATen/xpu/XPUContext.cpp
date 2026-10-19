@@ -2,9 +2,7 @@
 #include <c10/util/CallOnce.h>
 #include <c10/util/Exception.h>
 
-#include <cmath>
 #include <deque>
-#include <mutex>
 #include <vector>
 
 namespace at::xpu {
@@ -18,7 +16,6 @@ namespace {
  * requested for a device.
  */
 DeviceIndex num_gpus = -1;
-c10::once_flag init_flag;
 std::deque<c10::once_flag> device_prop_flags;
 std::vector<DeviceProp> device_properties;
 
@@ -26,11 +23,14 @@ std::deque<c10::once_flag> device_global_idx_flags;
 std::vector<int32_t> device_global_idxs;
 
 void initXPUContextVectors() {
-  num_gpus = c10::xpu::device_count();
-  device_prop_flags.resize(num_gpus);
-  device_properties.resize(num_gpus);
-  device_global_idx_flags.resize(num_gpus);
-  device_global_idxs.resize(num_gpus);
+  static bool init_flag [[maybe_unused]] = []() {
+    num_gpus = c10::xpu::device_count();
+    device_prop_flags.resize(num_gpus);
+    device_properties.resize(num_gpus);
+    device_global_idx_flags.resize(num_gpus);
+    device_global_idxs.resize(num_gpus);
+    return true;
+  }();
 }
 
 void initDeviceProperty(DeviceIndex device) {
@@ -46,19 +46,9 @@ void initDeviceGlobalIdx(DeviceIndex device) {
   };
   auto it = std::find_if(devices.begin(), devices.end(), match_device);
   TORCH_CHECK(
-      it != devices.end(), "Cant't find the global index of XPU device.");
+      it != devices.end(), "Can't find the global index of XPU device.");
   device_global_idxs[device] =
       static_cast<int32_t>(std::distance(devices.begin(), it));
-}
-
-inline void check_device(DeviceIndex device) {
-  TORCH_CHECK(
-      device >= 0 && device < num_gpus,
-      "device is out of range, device is ",
-      static_cast<int>(device),
-      ", total number of device is ",
-      static_cast<int>(num_gpus),
-      ".");
 }
 
 } // anonymous namespace
@@ -69,10 +59,10 @@ DeviceProp* getCurrentDeviceProperties() {
 }
 
 DeviceProp* getDeviceProperties(DeviceIndex device) {
-  c10::call_once(init_flag, initXPUContextVectors);
+  initXPUContextVectors();
   if (device == -1)
     device = c10::xpu::current_device();
-  check_device(device);
+  check_device_index(device);
   c10::call_once(device_prop_flags[device], initDeviceProperty, device);
   return &device_properties[device];
 }
@@ -80,10 +70,31 @@ DeviceProp* getDeviceProperties(DeviceIndex device) {
 // Return the global index enumerated by sycl::device::get_devices based on the
 // index of a XPU device in the framework.
 int32_t getGlobalIdxFromDevice(DeviceIndex device) {
-  c10::call_once(init_flag, initXPUContextVectors);
-  check_device(device);
+  initXPUContextVectors();
+  if (device == -1)
+    device = c10::xpu::current_device();
+  check_device_index(device);
   c10::call_once(device_global_idx_flags[device], initDeviceGlobalIdx, device);
   return device_global_idxs[device];
+}
+
+// Check if a device can access the memory of a peer device directly.
+bool canDeviceAccessPeer(DeviceIndex device, DeviceIndex peer) {
+  if (device == -1) {
+    device = c10::xpu::current_device();
+  }
+  if (peer == -1) {
+    peer = c10::xpu::current_device();
+  }
+  check_device_index(device);
+  check_device_index(peer);
+  // A device can always access itself
+  if (device == peer) {
+    return true;
+  }
+  return c10::xpu::get_raw_device(device).ext_oneapi_can_access_peer(
+      c10::xpu::get_raw_device(peer),
+      sycl::ext::oneapi::peer_access::access_supported);
 }
 
 } // namespace at::xpu

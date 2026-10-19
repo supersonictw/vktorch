@@ -1,24 +1,47 @@
 # Owner(s): ["module: functorch"]
 
+import contextlib
+import io
+
 import torch
-from functorch.compile import minifier
-from torch._functorch.compile_utils import get_placeholders, get_outputs
 from functorch import make_fx
-from torch.testing._internal.common_utils import TestCase, run_tests
+from functorch.compile import minifier
+from torch._functorch.compile_utils import get_outputs, get_placeholders
+from torch._functorch.fx_minifier import dump_state, MinifierSanityCheckFailed
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 class TestMinifier(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_sanity_check_failure_type(self):
+        def f(x):
+            return torch.sin(x)
+
+        inputs = [torch.randn(3)]
+        graph = make_fx(f)(*inputs)
+
+        with self.assertRaisesRegex(
+            MinifierSanityCheckFailed, "Input graph did not fail the tester"
+        ):
+            minifier(graph, inputs, lambda gm, args: False)
+
     def test_has_mul_minifier(self):
         def failing_f(x, y):
             y = y / 3
             x = x + 3
             x = x * y
             return x + y
+
         inps = [torch.randn(3), torch.randn(3)]
         failing_f = make_fx(failing_f)(*inps)
 
         def has_mul(fx_g, inps):
-            return (torch.ops.aten.mul.Tensor in (i.target for i in fx_g.graph.nodes))
+            return torch.ops.aten.mul.Tensor in (i.target for i in fx_g.graph.nodes)
 
         min_f, inps = minifier(failing_f, inps, has_mul)
         self.assertEqual(len(min_f.graph.nodes), 4)
@@ -54,6 +77,7 @@ class TestMinifier(TestCase):
             c = c.cos()
             d = a * c
             return (a, b, c, d)
+
         inps = [torch.randn(3) for _ in range(3)]
 
         def inputs_returned(fx_g, inps):
@@ -74,7 +98,7 @@ class TestMinifier(TestCase):
         inps = [torch.randn(3), torch.randn(3)]
 
         def has_add(fx_g, inps):
-            return (torch.ops.aten.add.Tensor in (i.target for i in fx_g.graph.nodes))
+            return torch.ops.aten.add.Tensor in (i.target for i in fx_g.graph.nodes)
 
         failing_f = make_fx(f)(*inps)
         min_f, inps = minifier(failing_f, inps, has_add)
@@ -84,7 +108,7 @@ class TestMinifier(TestCase):
 
     def test_module(self):
         class MockModule(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.relu = torch.nn.ReLU()
 
@@ -108,8 +132,34 @@ class TestMinifier(TestCase):
             return torch.isnan(fx_g(*inps)[0]).any()
 
         min_f, inps = minifier(failing_f, inps, pass_checker)
-        assert len(min_f.graph.nodes) == 3
-        assert len(inps) == 1
+        if len(min_f.graph.nodes) != 3:
+            raise AssertionError(
+                f"Expected 3 graph nodes, got {len(min_f.graph.nodes)}"
+            )
+        if len(inps) != 1:
+            raise AssertionError(f"Expected 1 input, got {len(inps)}")
+
+    def test_dump_state_preserves_device_index(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        graph.output(x)
+        gm = torch.fx.GraphModule({}, graph)
+
+        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+        fake_tensor = (
+            torch._subclasses.fake_tensor.FakeTensorConverter().from_meta_and_device(
+                fake_mode,
+                torch.empty_strided((2, 3), (3, 1), device="meta"),
+                torch.device("cuda:7"),
+            )
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dump_state(gm, [fake_tensor])
+
+        repro = buf.getvalue()
+        self.assertIn("'cuda:7'", repro)
 
 
 if __name__ == "__main__":

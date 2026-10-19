@@ -1,33 +1,59 @@
 #!/usr/bin/env python3
-import functools
+
 import gc
 import importlib
 import logging
 import os
 import re
 import sys
+import tempfile
 import warnings
+from collections import namedtuple
+from functools import cached_property
 from os.path import abspath, exists
 
 import torch
-import yaml
+
 
 try:
-    from .common import BenchmarkRunner, main
+    from .common import BenchmarkRunner, load_yaml_file, main
 except ImportError:
-    from common import BenchmarkRunner, main
+    from common import BenchmarkRunner, load_yaml_file, main
 
 from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
 
+
 # We are primarily interested in tf32 datatype
 torch.backends.cuda.matmul.allow_tf32 = True
+
+# Enable FX graph caching
+if "TORCHINDUCTOR_FX_GRAPH_CACHE" not in os.environ:
+    torch._inductor.config.fx_graph_cache = True
+
+# Enable Autograd caching
+if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
+    torch._functorch.config.enable_autograd_cache = True
+
+
+def _reassign_parameters(model):
+    # torch_geometric models register parameter as tensors due to
+    # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/dense/linear.py#L158-L168
+    # Since it is unusual thing to do, we just reassign them to parameters
+    def state_dict_hook(module, destination, prefix, local_metadata):
+        for name, param in module.named_parameters():
+            if isinstance(destination[name], torch.Tensor) and not isinstance(
+                destination[name], torch.nn.Parameter
+            ):
+                destination[name] = torch.nn.Parameter(destination[name])
+
+    model._register_state_dict_hook(state_dict_hook)
 
 
 def setup_torchbench_cwd():
     original_dir = abspath(os.getcwd())
 
-    os.environ["KALDI_ROOT"] = "/tmp"  # avoids some spam
+    os.environ["KALDI_ROOT"] = tempfile.gettempdir()  # avoids some spam
     for torchbench_dir in (
         "./torchbenchmark",
         "../torchbenchmark",
@@ -36,6 +62,9 @@ def setup_torchbench_cwd():
         "../../torchbenchmark",
         "../../torchbench",
         "../../benchmark",
+        "../../../torchbenchmark",
+        "../../../torchbench",
+        "../../../benchmark",
     ):
         if exists(torchbench_dir):
             break
@@ -48,29 +77,7 @@ def setup_torchbench_cwd():
     return original_dir
 
 
-@functools.lru_cache(maxsize=1)
-def load_yaml_file():
-    filename = "torchbench.yaml"
-    filepath = os.path.join(os.path.dirname(__file__), filename)
-
-    with open(filepath) as f:
-        data = yaml.safe_load(f)
-
-    def flatten(lst):
-        for item in lst:
-            if isinstance(item, list):
-                yield from flatten(item)
-            else:
-                yield item
-
-    def maybe_list_to_set(obj):
-        if isinstance(obj, dict):
-            return {k: maybe_list_to_set(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return set(flatten(obj))
-        return obj
-
-    return maybe_list_to_set(data)
+process_train_model_output = {}
 
 
 class TorchBenchmarkRunner(BenchmarkRunner):
@@ -81,7 +88,7 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     @property
     def _config(self):
-        return load_yaml_file()
+        return load_yaml_file("torchbench.yaml")
 
     @property
     def _skip(self):
@@ -96,6 +103,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         return self._config["tolerance"]
 
     @property
+    def _require_larger_multiplier_for_smaller_tensor(self):
+        return self._config["require_larger_multiplier_for_smaller_tensor"]
+
+    @property
     def _accuracy(self):
         return self._config["accuracy"]
 
@@ -108,8 +119,28 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         return self._skip["device"]["cpu"]
 
     @property
+    def skip_models_for_cpu_aarch64(self):
+        return self._skip["device"]["cpu_aarch64"]
+
+    @property
     def skip_models_for_cuda(self):
         return self._skip["device"]["cuda"]
+
+    @property
+    def skip_models_for_xpu(self):
+        return self._skip["device"]["xpu"]
+
+    @property
+    def skip_models_for_freezing_cuda(self):
+        return self._skip["freezing"]["cuda"]
+
+    @property
+    def disable_cudagraph_models(self):
+        return self._config["disable_cudagraph"]
+
+    @property
+    def skip_models_for_freezing_cpu(self):
+        return self._skip["freezing"]["cpu"]
 
     @property
     def slow_models(self):
@@ -122,6 +153,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     @property
     def non_deterministic_models(self):
         return self._config["non_deterministic"]
+
+    @property
+    def get_output_amp_train_process_func(self):
+        return process_train_model_output
 
     @property
     def skip_not_suitable_for_training_models(self):
@@ -138,6 +173,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     @property
     def force_fp16_for_bf16_models(self):
         return self._config["dtype"]["force_fp16_for_bf16_models"]
+
+    @property
+    def amp_dtype_bfloat16(self):
+        return self._config["dtype"]["amp_dtype_bfloat16"]
 
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
@@ -159,6 +198,22 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     def skip_models_due_to_control_flow(self):
         return self._skip["control_flow"]
 
+    @property
+    def skip_models_due_to_export_not_supported(self):
+        return self._skip["export_not_supported"]
+
+    @property
+    def guard_on_nn_module_models(self):
+        return {
+            "vision_maskrcnn",
+        }
+
+    @cached_property
+    def _fb_models_available(self):
+        """This property exists because importing IS_FBCODE causes some models to be
+        frozen out of setting certain config flags."""
+        return importlib.util.find_spec("torchbenchmark.models.fb") is not None
+
     def load_model(
         self,
         device,
@@ -173,12 +228,14 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             )
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
-        dynamic_shapes = self.args.dynamic_shapes
+
         candidates = [
             f"torchbenchmark.models.{model_name}",
             f"torchbenchmark.canary_models.{model_name}",
-            f"torchbenchmark.models.fb.{model_name}",
         ]
+        if self._fb_models_available:
+            candidates.append(f"torchbenchmark.models.fb.{model_name}")
+
         for c in candidates:
             try:
                 module = importlib.import_module(c)
@@ -225,6 +282,11 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         if part:
             extra_args += ["--part", part]
 
+        # sam_fast only runs with amp
+        if model_name == "sam_fast":
+            self.args.amp = True
+            self.setup_amp()
+
         if model_name == "vision_maskrcnn" and is_training:
             # Output of vision_maskrcnn model is a list of bounding boxes,
             # sorted on the basis of their scores. This makes accuracy
@@ -240,6 +302,7 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 extra_args=extra_args,
                 model_kwargs=model_kwargs,
             )
+            use_eval_mode = True
         elif is_training:
             benchmark = benchmark_cls(
                 test="train",
@@ -255,6 +318,13 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 extra_args=extra_args,
             )
         model, example_inputs = benchmark.get_module()
+        if model_name in [
+            "basic_gnn_edgecnn",
+            "basic_gnn_gcn",
+            "basic_gnn_sage",
+            "basic_gnn_gin",
+        ]:
+            _reassign_parameters(model)
 
         # Models that must be in train mode while training
         if is_training and (
@@ -265,7 +335,18 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             model.eval()
         gc.collect()
         batch_size = benchmark.batch_size
-
+        if model_name == "torchrec_dlrm":
+            batch_namedtuple = namedtuple(
+                "Batch", "dense_features sparse_features labels"
+            )
+            example_inputs = tuple(
+                batch_namedtuple(
+                    dense_features=batch.dense_features,
+                    sparse_features=batch.sparse_features,
+                    labels=batch.labels,
+                )
+                for batch in example_inputs
+            )
         # Torchbench has quite different setup for yolov3, so directly passing
         # the right example_inputs
         if model_name == "yolov3":
@@ -273,7 +354,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         # See https://github.com/pytorch/benchmark/issues/1561
         if model_name == "maml_omniglot":
             batch_size = 5
-            assert example_inputs[0].shape[0] == batch_size
+            if example_inputs[0].shape[0] != batch_size:
+                raise AssertionError(
+                    f"Expected batch size {batch_size}, but got {example_inputs[0].shape[0]}"
+                )
         if model_name == "vision_maskrcnn":
             batch_size = 1
         # global current_name, current_device
@@ -283,7 +367,21 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         if self.args.trace_on_xla:
             # work around for: https://github.com/pytorch/xla/issues/4174
             import torch_xla  # noqa: F401
-        self.validate_model(model, example_inputs)
+
+        # Turning off kv cache for torchbench models. This is not the right
+        # thing to do, but the torchbench models are way outdated, and since we
+        # are using torchbench pt2 dashboard to track regressions (rather than
+        # improving performance), we are just setting the kv cache to false.
+        # Real transformers benchmarks will be added soon using a different
+        # infra.
+        if (
+            model_name.startswith("hf")
+            and hasattr(model, "config")
+            and hasattr(model.config, "use_cache")
+        ):
+            model.config.use_cache = False
+
+        self.validate_model(benchmark.name, model, example_inputs)
         return device, benchmark.name, model, example_inputs, batch_size
 
     def iter_model_names(self, args):
@@ -304,8 +402,8 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
             model_name = os.path.basename(model_path)
             if (
-                not re.search("|".join(args.filter), model_name, re.I)
-                or re.search("|".join(args.exclude), model_name, re.I)
+                not re.search("|".join(args.filter), model_name, re.IGNORECASE)
+                or re.search("|".join(args.exclude), model_name, re.IGNORECASE)
                 or model_name in args.exclude_exact
                 or model_name in self.skip_models
             ):
@@ -314,25 +412,51 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             yield model_name
 
     def pick_grad(self, name, is_training):
-        if is_training or name in ("maml",):
+        if is_training or name == "maml":
             return torch.enable_grad()
         else:
             return torch.no_grad()
+
+    def use_larger_multiplier_for_smaller_tensor(self, name):
+        return name in self._require_larger_multiplier_for_smaller_tensor
+
+    def use_iou_for_bool_accuracy(self, name):
+        iou_models = self._tolerance.get("use_iou_for_bool_masks", [])
+        return name in iou_models
+
+    def get_iou_threshold(self, name):
+        iou_thresholds = self._tolerance.get("iou_thresholds", {})
+        return iou_thresholds.get(name, 0.99)
+
+    def get_accuracy_check_runs(self, name):
+        accuracy_check_runs = self._tolerance.get("accuracy_check_runs", {})
+        return accuracy_check_runs.get(name, 1)
 
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         tolerance = 1e-4
         cosine = self.args.cosine
         # Increase the tolerance for torch allclose
         if self.args.float16 or self.args.amp:
+            if self.args.freezing and (freezing := self._tolerance["freezing"]):
+                higher_fp16 = freezing.get("higher_fp16", None)
+                even_higher = freezing.get("even_higher", None)
+                if higher_fp16 and name in higher_fp16:
+                    return 1e-2, cosine
+                elif even_higher and name in even_higher:
+                    return 8 * 1e-2, cosine
             if name in self._tolerance["higher_fp16"]:
                 return 1e-2, cosine
+            elif name in self._tolerance["even_higher"]:
+                return 8 * 1e-2, cosine
             return 1e-3, cosine
 
         if self.args.bfloat16:
             if name in self._tolerance["higher_bf16"]:
                 return 1e-2, cosine
+            elif current_device == "xpu" and name in self._tolerance["higher_bf16_xpu"]:
+                return 8 * 1e-2, cosine
 
-        if is_training and current_device == "cuda":
+        if is_training and (current_device == "cuda" or current_device == "xpu"):
             tolerance = 1e-3
             if name in self._tolerance["cosine"]:
                 cosine = True
@@ -347,18 +471,24 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
         with self.autocast(**self.autocast_arg):
-            return mod(*inputs)
+            if isinstance(inputs, dict):
+                return mod(**inputs)
+            else:
+                return mod(*inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
         with self.autocast(**self.autocast_arg):
-            pred = mod(*cloned_inputs)
+            if isinstance(cloned_inputs, dict):
+                pred = mod(**cloned_inputs)
+            else:
+                pred = mod(*cloned_inputs)
             loss = self.compute_loss(pred)
         self.grad_scaler.scale(loss).backward()
         self.optimizer_step()
         if collect_outputs:
-            return collect_results(mod, pred, loss, cloned_inputs)
+            return collect_results(mod, None, loss, cloned_inputs)
         return None
 
 

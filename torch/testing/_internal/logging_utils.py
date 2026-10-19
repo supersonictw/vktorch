@@ -6,8 +6,12 @@ import os
 import contextlib
 import torch._logging
 import torch._logging._internal
+from contextlib import AbstractContextManager
+from collections.abc import Callable
 from torch._dynamo.utils import LazyString
+from torch._inductor import config as inductor_config
 import logging
+import io
 
 @contextlib.contextmanager
 def preserve_log_state():
@@ -73,6 +77,7 @@ def kwargs_to_settings(**kwargs):
 # that the logs are setup correctly and capturing the correct records.
 def make_logging_test(**kwargs):
     def wrapper(fn):
+        @inductor_config.patch({"fx_graph_cache": False})
         def test_fn(self):
 
             torch._dynamo.reset()
@@ -129,6 +134,9 @@ class LoggingTestCase(torch._dynamo.test_case.TestCase):
         torch._logging._internal.log_state.clear()
         torch._logging._init_logs()
 
+    def hasRecord(self, records, m):
+        return any(m in r.getMessage() for r in records)
+
     def getRecord(self, records, m):
         record = None
         for r in records:
@@ -150,32 +158,101 @@ class LoggingTestCase(torch._dynamo.test_case.TestCase):
     # as they are emitted
     def _handler_watcher(self, record_list):
         exit_stack = contextlib.ExitStack()
+        seen_record_ids = set()
 
         def emit_post_hook(record):
             nonlocal record_list
-            record_list.append(record)
+            record_id = id(record)
+            if record_id not in seen_record_ids:
+                seen_record_ids.add(record_id)
+                record_list.append(record)
 
-        # registered logs are the only ones with handlers, so patch those
+        # Registered logs are the only ones with handlers, so patch those. Count and
+        # patch only torch-owned handlers: when running under pytest (or any framework
+        # that attaches its own capture handlers to these loggers), those foreign
+        # handlers must not count against torch's own handler budget.
         for log_qname in torch._logging._internal.log_registry.get_log_qnames():
             logger = logging.getLogger(log_qname)
-            num_handlers = len(logger.handlers)
+            torch_handlers = [
+                h
+                for h in logger.handlers
+                if torch._logging._internal._is_torch_handler(h)
+            ]
+            num_handlers = len(torch_handlers)
             self.assertLessEqual(
                 num_handlers,
                 2,
-                "All pt2 loggers should only have at most two handlers (debug artifacts and messages above debug level).",
+                "All pt2 loggers should only have at most two Torch handlers (debug artifacts and messages above debug level).",
             )
 
-            self.assertGreater(num_handlers, 0, "All pt2 loggers should have more than zero handlers")
+            self.assertGreater(num_handlers, 0, "All pt2 loggers should have more than zero Torch handlers")
 
-            for handler in logger.handlers:
+            for handler in torch_handlers:
                 old_emit = handler.emit
 
-                def new_emit(record):
-                    old_emit(record)
-                    emit_post_hook(record)
+                def make_emit(old_emit):
+                    def new_emit(record):
+                        old_emit(record)
+                        emit_post_hook(record)
+
+                    return new_emit
 
                 exit_stack.enter_context(
-                    unittest.mock.patch.object(handler, "emit", new_emit)
+                    unittest.mock.patch.object(handler, "emit", make_emit(old_emit))
                 )
 
         return exit_stack
+
+
+def logs_to_string(module, log_option):
+    """Example:
+    logs_to_string("torch._inductor.compile_fx", "post_grad_graphs")
+    returns the output of TORCH_LOGS="post_grad_graphs" from the
+    torch._inductor.compile_fx module.
+    """
+    log_stream = io.StringIO()
+    handler = logging.StreamHandler(stream=log_stream)
+
+    @contextlib.contextmanager
+    def tmp_redirect_logs():
+        try:
+            logger = torch._logging.getArtifactLogger(module, log_option)
+            logger.addHandler(handler)
+            yield
+        finally:
+            logger.removeHandler(handler)
+
+    def ctx_manager():
+        exit_stack = log_settings(log_option)
+        exit_stack.enter_context(tmp_redirect_logs())
+        return exit_stack
+
+    return log_stream, ctx_manager
+
+
+def multiple_logs_to_string(module: str, *log_options: str) -> tuple[list[io.StringIO], Callable[[], AbstractContextManager[None]]]:
+    """Example:
+    multiple_logs_to_string("torch._inductor.compile_fx", "pre_grad_graphs", "post_grad_graphs")
+    returns the output of TORCH_LOGS="pre_graph_graphs, post_grad_graphs" from the
+    torch._inductor.compile_fx module.
+    """
+    log_streams = [io.StringIO() for _ in range(len(log_options))]
+    handlers = [logging.StreamHandler(stream=log_stream) for log_stream in log_streams]
+
+    @contextlib.contextmanager
+    def tmp_redirect_logs():
+        loggers = [torch._logging.getArtifactLogger(module, option) for option in log_options]
+        try:
+            for logger, handler in zip(loggers, handlers, strict=True):
+                logger.addHandler(handler)
+            yield
+        finally:
+            for logger, handler in zip(loggers, handlers, strict=True):
+                logger.removeHandler(handler)
+
+    def ctx_manager() -> AbstractContextManager[None]:
+        exit_stack = log_settings(", ".join(log_options))
+        exit_stack.enter_context(tmp_redirect_logs())
+        return exit_stack  # type: ignore[return-value]
+
+    return log_streams, ctx_manager

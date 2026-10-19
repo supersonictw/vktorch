@@ -4,12 +4,15 @@ import logging
 
 from torch.distributed._shard.sharded_tensor.logger import _get_or_create_logger
 from torch.testing._internal.common_utils import (
-    TestCase,
+    HardwareClassification,
     run_tests,
+    TestCase,
 )
 
 
 class ShardingSpecLoggerTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_get_or_create_logger(self):
         logger = _get_or_create_logger()
         self.assertIsNotNone(logger)

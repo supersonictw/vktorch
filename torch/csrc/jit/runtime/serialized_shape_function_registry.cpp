@@ -6,9 +6,6 @@
  * cd ~/pytorch && python
  * torchgen/shape_functions/gen_jit_shape_functions.py
  */
-#include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/inliner.h>
-#include <torch/csrc/jit/runtime/operator.h>
 #include <torch/csrc/jit/runtime/serialized_shape_function_registry.h>
 
 // clang-format off
@@ -16,7 +13,7 @@
 namespace torch::jit {
 
 
-std::string shape_funcs = ""
+static std::string shape_funcs = ""
 + std::string(R"=====(
 def unary(self: List[int]) -> List[int]:
   out = annotate(List[int], [])
@@ -3014,6 +3011,18 @@ def native_batch_norm(input: List[int],
     _1 = torch.append(out, elem)
   return (out, _size, _size)
 
+def _batch_norm_with_update(input: List[int],
+    weight: Optional[List[int]],
+    bias: Optional[List[int]],
+    running_mean: Optional[List[int]],
+    running_var: Optional[List[int]]) -> Tuple[List[int], List[int], List[int], List[int]]:
+  _size = [input[1]]
+  out = annotate(List[int], [])
+  for _0 in range(torch.len(input)):
+    elem = input[_0]
+    _1 = torch.append(out, elem)
+  return (out, _size, _size, [0])
+
 )=====")
 + std::string(R"=====(def cross_entropy_loss(self: List[int],
     target: List[int],
@@ -3192,7 +3201,7 @@ def native_batch_norm(input: List[int],
 )=====")
 + std::string(R"=====(def broadcast_inplace(a: List[int],
     b: List[int]) -> List[int]:
-  _0 = "The dims of tensor b ({}) must be less than or equal tothe dims of tensor a ({}) "
+  _0 = "The dims of tensor b ({}) must be less than or equal to the dims of tensor a ({}) "
   _1 = "The size of tensor a {} must match the size of tensor b ({}) at non-singleton dimension {}"
   dimsA = torch.len(a)
   dimsB = torch.len(b)
@@ -3312,6 +3321,7 @@ const OperatorMap<std::string>& GetShapeFunctionMappings() {
     {"aten::native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)", "native_batch_norm"},
     {"aten::_native_batch_norm_legit(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)", "native_batch_norm"},
     {"aten::_native_batch_norm_legit.no_stats(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)", "native_batch_norm"},
+    {"aten::_batch_norm_with_update(Tensor input, Tensor? weight, Tensor? bias, Tensor(a!) running_mean, Tensor(b!) running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor)", "_batch_norm_with_update"},
     {"aten::cross_entropy_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean, SymInt ignore_index=-100, float label_smoothing=0.0) -> Tensor", "cross_entropy_loss"},
     {"aten::lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor", "broadcast_three"},
     {"aten::where.ScalarSelf(Tensor condition, Scalar self, Tensor other) -> Tensor", "broadcast_one_three"},

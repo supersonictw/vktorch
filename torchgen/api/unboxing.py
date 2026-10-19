@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from __future__ import annotations
 
 from torchgen.api import cpp
 from torchgen.api.types import Binding, CppSignatureGroup, CType
@@ -12,6 +12,7 @@ from torchgen.model import (
     Type,
 )
 
+
 # This file generates the code for unboxing wrappers, i.e., the glue logic to unbox a boxed operator and convert the
 # ivalues from stack to correct arguments to the unboxed kernel, based on corresponding JIT schema. This codegen is
 # an alternative way to generate unboxing wrappers similar to the existing C++ metaprogramming approach but gets the
@@ -22,15 +23,14 @@ from torchgen.model import (
 #
 # - Function Schema (source of truth)
 #
-#      aten::empty.names(int[] size, *, Dimname[]? names,
-#                        ScalarType? dtype=None, Layout? layout=None,
-#                        Device? device=None, bool? pin_memory=None,
-#                        MemoryFormat? memory_format=None) -> Tensor
+#      aten::zeros(int[] size, *, ScalarType? dtype=None, Layout? layout=None,
+#                  Device? device=None, bool? pin_memory=None) -> Tensor
+#
 # - Argument Conversion
 #       Generates C++ code to convert an ivalue (from stack) to its underlying C++ type.
 #    - int[] size
 #        ```cpp
-#           const c10::List<c10::IValue> size_list_in = (std::move(peek(stack, 0, 7))).toList();
+#           const c10::List<c10::IValue> size_list_in = (std::move(peek(stack, 0, 5))).toList();
 #
 #           std::vector<int64_t> size_vec;
 #           for (c10::IValue size_elem: size_list_in) {
@@ -41,56 +41,33 @@ from torchgen.model import (
 #                                 ~~~~~~~~~~~~~ <-- The converted argument from ivalues in the stack.
 #                                                   Will be passed to unboxed kernel.
 #       ```
-#    - Dimname[]? names
+#    - ScalarType? dtype
 #       ```cpp
-#           c10::optional<c10::IValue> names_opt = (std::move(peek(stack, 1, 7))).toOptional<c10::IValue>();
-#           c10::optional<at::ArrayRef<at::Dimname>> names_opt_out;
-#           if (names_opt.has_value()) {
-#                         ~~~~~~~~~~~ <-- Unwrapping optional shell
-#               const c10::IValue names_opt_in = names_opt.value();
-#               const c10::List<c10::IValue> names_list_in = names_opt_in.toList();
-#
-#               std::vector<at::Dimname> names_vec;
-#               for (c10::IValue names_elem: names_list_in) {
-#                                ~~~~~~~~~~~~~~~~~~~~~~~~~ <-- Unrolling list, then convert elements one by one.
-#                   at::Dimname names_base = names_elem.to<at::Dimname>();
-#                   names_vec.push_back(names_base);
-#               }
-#               at::ArrayRef<at::Dimname> names_list_out(names_vec);
-#
-#               names_opt_out = c10::optional<at::ArrayRef<at::Dimname>>(names_list_out);
-#           } else {
-#               names_opt_out = c10::optional<at::ArrayRef<at::Dimname>>();
-#           }
-#       ```
-#    - ScalarType? dtype (similarly for the rest of the arguments)
-#       ```cpp
-#           c10::optional<c10::IValue> dtype_opt = (std::move(peek(stack, 2, 7))).toOptional<c10::IValue>();
-#           c10::optional<at::ScalarType> dtype_opt_out;
+#           ::std::optional<c10::IValue> dtype_opt = (std::move(peek(stack, 1, 5))).toOptional<c10::IValue>();
+#           ::std::optional<at::ScalarType> dtype_opt_out;
 #           if (dtype_opt.has_value()) {
+#                         ~~~~~~~~~~~ <-- Unwrapping optional shell
 #               const c10::IValue dtype_opt_in = dtype_opt.value();
 #               at::ScalarType dtype_base = dtype_opt_in.to<at::ScalarType>();
 #                                                        ~~~~~~~~~~~~~~~~~~~~ <-- For base types, convert ivalue to it
 #                                                                                 directly using ".to<T>()" API.
-#               dtype_opt_out = c10::optional<at::ScalarType>(dtype_base);
+#               dtype_opt_out = ::std::optional<at::ScalarType>(dtype_base);
 #           } else {
-#               dtype_opt_out = c10::optional<at::ScalarType>();
+#               dtype_opt_out = ::std::optional<at::ScalarType>();
 #           }
 #       ```
 #
 # - Unboxed Kernel Call
 #   ```cpp
-#       auto result_ = torch::empty(
+#       auto result_ = torch::zeros(
 #           size_list_out,
-#           names_opt_out,
-#           options,
-#           memory_format_opt_out
+#           options
 #       );
 #   ```
 #
 # - Push Result Back to Stack
 #   ```cpp
-#       drop(stack, 7);
+#       drop(stack, 5);
 #       pack(stack, std::move(result_));
 #   ```
 connector = "\n\t"
@@ -102,7 +79,7 @@ def name(f: NativeFunction) -> str:
 
 
 # Convert all the arguments in a NativeFunction to C++ code
-def convert_arguments(f: NativeFunction) -> Tuple[List[Binding], List[str]]:
+def convert_arguments(f: NativeFunction) -> tuple[list[Binding], list[str]]:
     # we need the 'self' argument so method needs to be False
     args = (
         CppSignatureGroup.from_native_function(f, method=False)
@@ -117,7 +94,7 @@ def convert_arguments(f: NativeFunction) -> Tuple[List[Binding], List[str]]:
     for arg in args:
         # expecting only Argument
         if not isinstance(arg.argument, Argument):
-            raise Exception(
+            raise Exception(  # noqa: TRY002
                 f"Unexpected argument type, expecting `Argument` but got {arg}"
             )
         argument: Argument = arg.argument
@@ -137,7 +114,7 @@ def convert_arguments(f: NativeFunction) -> Tuple[List[Binding], List[str]]:
 # (2) A Binding corresponding to the newly created unboxed variable, including variable name and its CType
 def argumenttype_ivalue_convert(
     t: Type, arg_name: str, *, mutable: bool = False
-) -> Tuple[str, CType, List[str], List[str]]:
+) -> tuple[str, CType, list[str], list[str]]:
     # Unboxing is for mobile, which doesn't care about SymInts
     ctype = cpp.argumenttype_type(
         t=t, mutable=mutable, binds=arg_name, symint=False
@@ -165,13 +142,13 @@ def argumenttype_ivalue_convert(
             ctype=ctype,
         )
     else:
-        raise Exception(f"Cannot handle type {t}. arg_name: {arg_name}")
+        raise Exception(f"Cannot handle type {t}. arg_name: {arg_name}")  # noqa: TRY002
     return out_name, ctype, code, decl
 
 
 def _gen_code_base_type(
     arg_name: str, out_name: str, ctype: CType
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     return [
         f"{ctype.cpp_type(strip_ref=True)} {out_name} = {arg_name}.to<{ctype.cpp_type(strip_ref=True)}>();"
     ], []
@@ -179,12 +156,12 @@ def _gen_code_base_type(
 
 def _gen_code_optional_type(
     arg_name: str, out_name: str, t: OptionalType, ctype: CType
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     in_name = f"{arg_name}_opt_in"
     res_name, _, res_code, decl = argumenttype_ivalue_convert(t.elem, in_name)
     return (
         f"""
-c10::optional<c10::IValue> {arg_name}_opt = {arg_name}.toOptional<c10::IValue>();
+auto {arg_name}_opt = {arg_name}.toOptional<c10::IValue>();
 {ctype.cpp_type(strip_ref=True)} {out_name};
 if ({arg_name}_opt.has_value()) {{
     const c10::IValue {in_name} = {arg_name}_opt.value();
@@ -193,16 +170,14 @@ if ({arg_name}_opt.has_value()) {{
 }} else {{
     {out_name} = {ctype.cpp_type(strip_ref=True)}();
 }}
-        """.split(
-            "\n"
-        ),
+        """.split("\n"),
         decl,
     )
 
 
 def _gen_code_list_type(
     arg_name: str, out_name: str, t: ListType, ctype: CType
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     in_name = f"{arg_name}_list_in"
     elem_name = f"{arg_name}_elem"
     code = [f"const c10::List<c10::IValue> {in_name} = {arg_name}.toList();"]
@@ -212,11 +187,9 @@ def _gen_code_list_type(
         code.extend(
             f"""
 {ctype.cpp_type(strip_ref=True)} {out_name} = as_array<{res_ctype.cpp_type(strip_ref=True)}, {t.size}>({in_name});
-            """.split(
-                "\n"
-            )
+            """.split("\n")
         )
-    # we have to use c10::List for optional element. e.g., Tensor?[] -> c10::List<c10::optional<at::Tensor>>
+    # we have to use c10::List for optional element. e.g., Tensor?[] -> c10::List<::std::optional<at::Tensor>>
     elif isinstance(t.elem, OptionalType):
         code.extend(
             f"""
@@ -225,9 +198,7 @@ for (c10::IValue {elem_name}: {in_name}) {{
     {connector.join(res_code)}
     {out_name}.push_back({res_name});
 }}
-            """.split(
-                "\n"
-            )
+            """.split("\n")
         )
     else:
         # use ArrayRef as default.
@@ -241,8 +212,6 @@ for (c10::IValue {elem_name}: {in_name}) {{
     {vec_name}.push_back({res_name});
 }}
 {ctype.cpp_type(strip_ref=True)} {out_name}({vec_name});
-            """.split(
-                "\n"
-            )
+            """.split("\n")
         )
     return code, decl

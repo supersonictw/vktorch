@@ -285,7 +285,7 @@ along :attr:`dim` while the :attr:`input` elements are masked out
 according to the boolean tensor :attr:`mask`.
 
 Let ``x`` be a sequence of unmasked elements of one-dimensional slice
-of the :attr:`input` tensor. Cumsum of i-th element in ``x`` is
+of the :attr:`input` tensor. Cumprod of i-th element in ``x`` is
 defined as ``prod(x[:i])``.
 
 The boolean tensor :attr:`mask` defines the "validity" of
@@ -1012,7 +1012,7 @@ Args:
     input (Tensor): the input tensor
     dim (int or tuple of ints, optional): the dimension or dimensions to reduce.
       Default: None that is equivalent to ``tuple(range(input.ndim))``.
-    unbiased (bool): when True, use Bessel’s correction, otherwise, compute
+    unbiased (bool): when True, use Bessel's correction, otherwise, compute
       the uncorrected sample variance.
 
 Keyword args:
@@ -1148,7 +1148,7 @@ Args:
     input (Tensor): the input tensor
     dim (int or tuple of ints, optional): the dimension or dimensions to reduce.
       Default: None that is equivalent to ``tuple(range(input.ndim))``.
-    unbiased (bool): when True, use Bessel’s correction, otherwise, compute
+    unbiased (bool): when True, use Bessel's correction, otherwise, compute
       the uncorrected sample variance.
 
 Keyword args:

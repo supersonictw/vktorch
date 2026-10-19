@@ -25,7 +25,7 @@ TEST(TestHalf, Arithmetic) {
   ASSERT_EQ(one + one, 2);
 }
 
-TEST(TestHalf, Comparisions) {
+TEST(TestHalf, Comparisons) {
   Half zero = 0;
   Half one = 1;
   ASSERT_LT(zero, one);
@@ -62,7 +62,7 @@ TEST(TestHalf, Construction) {
 static std::string to_string(const Half& h) {
   std::stringstream ss;
   ss << h;
-  return ss.str();
+  return std::move(ss).str();
 }
 
 TEST(TestHalf, Half2String) {
@@ -83,14 +83,22 @@ TEST(TestHalf, HalfNumericLimits) {
   ASSERT_NE(limits::signaling_NaN(), limits::signaling_NaN());
 }
 
+TEST(TestBFloat16, BFloat16NumericLimits) {
+  using limits = std::numeric_limits<BFloat16>;
+  ASSERT_EQ(limits::infinity(), std::numeric_limits<float>::infinity());
+  ASSERT_NE(limits::quiet_NaN(), limits::quiet_NaN());
+  ASSERT_NE(limits::signaling_NaN(), limits::signaling_NaN());
+  ASSERT_NE(limits::signaling_NaN(), limits::infinity());
+}
+
 // Check the declared type of members of numeric_limits<Half> matches
 // the declared type of that member on numeric_limits<float>
 
-#define ASSERT_SAME_TYPE(name)                                \
-  static_assert(                                              \
-      std::is_same<                                           \
-          decltype(std::numeric_limits<Half>::name),          \
-          decltype(std::numeric_limits<float>::name)>::value, \
+#define ASSERT_SAME_TYPE(name)                         \
+  static_assert(                                       \
+      std::is_same_v<                                  \
+          decltype(std::numeric_limits<Half>::name),   \
+          decltype(std::numeric_limits<float>::name)>, \
       "decltype(" #name ") differs")
 
 ASSERT_SAME_TYPE(is_specialized);

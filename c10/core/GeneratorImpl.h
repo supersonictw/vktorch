@@ -61,6 +61,7 @@ struct C10_API GeneratorImpl : public c10::intrusive_ptr_target {
   GeneratorImpl(const GeneratorImpl& other) = delete;
   GeneratorImpl(GeneratorImpl&& other) = delete;
   GeneratorImpl& operator=(const GeneratorImpl& other) = delete;
+  GeneratorImpl& operator=(GeneratorImpl&& other) = delete;
 
   ~GeneratorImpl() override = default;
   c10::intrusive_ptr<GeneratorImpl> clone() const;
@@ -73,6 +74,18 @@ struct C10_API GeneratorImpl : public c10::intrusive_ptr_target {
   virtual uint64_t seed() = 0;
   virtual void set_state(const c10::TensorImpl& new_state) = 0;
   virtual c10::intrusive_ptr<c10::TensorImpl> get_state() const = 0;
+  virtual void graphsafe_set_state(
+      const c10::intrusive_ptr<c10::GeneratorImpl>& new_state);
+  virtual c10::intrusive_ptr<c10::GeneratorImpl> graphsafe_get_state() const;
+  // Reserves `increment` Philox outputs and writes 1-element int64 tensors
+  // (seed, offset, intragraph_offset); the values a kernel launched now should
+  // consume are (seed, offset + intragraph_offset), with the uint64 seed and
+  // offset reinterpreted as int64. Only supported by Philox-based generators.
+  virtual void philox_state(
+      uint64_t increment,
+      at::Tensor& seed,
+      at::Tensor& offset,
+      at::Tensor& intragraph_offset);
   Device device() const;
 
   // See Note [Acquire lock when using random generators]

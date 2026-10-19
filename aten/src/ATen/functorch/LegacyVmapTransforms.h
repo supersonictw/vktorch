@@ -120,7 +120,7 @@ struct VmapPhysicalToLogicalMap;
 //   levels: 012345
 struct TORCH_API VmapPhysicalView {
   VmapPhysicalView(Tensor&& tensor, std::bitset<kVmapNumLevels> levels)
-      : levels_(levels), tensor_(tensor) {
+      : levels_(levels), tensor_(std::move(tensor)) {
     // TORCH_INTERNAL_ASSERT(!isBatchedTensor(tensor));
   }
 
@@ -143,7 +143,7 @@ struct TORCH_API VmapPhysicalView {
   // mapping a physical tensor to a new logical tensor (BatchedTensor)
   VmapPhysicalToLogicalMap getPhysicalToLogicalMap() const;
 
-  // Maps a logical shape to a physical shape by pre-pending the batch
+  // Maps a logical shape to a physical shape by prepending the batch
   // sizes to the logical shape.
   VmapDimVector getPhysicalShape(IntArrayRef logical_shape) const;
   SymDimVector getPhysicalShape(c10::SymIntArrayRef logical_shape) const;

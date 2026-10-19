@@ -1,9 +1,10 @@
-# Owner(s): ["oncall: package/deploy"]
+# Owner(s): ["module: package/deploy"]
 
 from io import BytesIO
 
 from torch.package import PackageExporter
 from torch.testing._internal.common_utils import run_tests
+
 
 try:
     from .common import PackageTestCase

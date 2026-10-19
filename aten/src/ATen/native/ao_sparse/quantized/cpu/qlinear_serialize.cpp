@@ -9,8 +9,7 @@
 #include <utility>
 #endif
 
-namespace ao {
-namespace sparse {
+namespace ao::sparse {
 
 namespace {
 /**
@@ -116,7 +115,7 @@ BCSRSerializationType PackedLinearWeight::serialize() {
       w->C,
       w->RB,
       w->CB,
-      zero_points.data_ptr<int8_t>(),
+      zero_points.const_data_ptr<int8_t>(),
       qscheme_per_tensor);
 
   std::vector<int8_t>& packed_weight_values = std::get<0>(untiled_bcsr);
@@ -160,7 +159,7 @@ BCSRSerializationType PackedLinearWeight::serialize() {
 BCSRSerializationType PackedLinearWeightQnnp::serialize() {
   at::Tensor w_scales_compact;
   at::Tensor w_zero_points_compact;
-  const float* w_scales_data_ptr = w_scales_.data_ptr<float>();
+  const float* w_scales_data_ptr = w_scales_.const_data_ptr<float>();
   std::function<int8_t(uint8_t)> subtract_128 = [](uint8_t v) {
     return static_cast<int8_t>(static_cast<int16_t>(v) - 128);
   };
@@ -236,8 +235,8 @@ BCSRSerializationType PackedLinearWeightQnnp::serialize() {
       std::move(w_scales_compact),
       std::move(w_zero_points_compact),
       (q_scheme_ == c10::kPerTensorAffine),
-      wrapped_row_values,
-      wrapped_col_indices,
+      std::move(wrapped_row_values),
+      std::move(wrapped_col_indices),
       wrap_vector<uint8_t>(bcsr_matrix_->values, c10::kByte),
       output_channels_,
       input_channels_);
@@ -245,5 +244,4 @@ BCSRSerializationType PackedLinearWeightQnnp::serialize() {
 
 #endif // USE_PYTORCH_QNNPACK
 
-} // namespace sparse
 } // namespace ao

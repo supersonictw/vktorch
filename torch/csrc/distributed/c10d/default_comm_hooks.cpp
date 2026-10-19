@@ -1,4 +1,3 @@
-#include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/distributed/c10d/default_comm_hooks.hpp>
 
@@ -46,7 +45,7 @@ c10::intrusive_ptr<c10::ivalue::Future> FP16CompressCommHook::runHook(
 c10::intrusive_ptr<c10::ivalue::Future> _AllReduceBySumCommHook::runHook(
     GradBucket& bucket) {
   std::vector<at::Tensor> tensors = {bucket.getBufferRef()};
-#ifdef IS_NCCL_EXP
+#ifdef IS_NCCLX
   // case with sparse_metadata_ set and using indices from there
   if (bucket.getSparseGradIndices().has_value()) {
     AllreduceOptions opts = AllreduceOptions();

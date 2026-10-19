@@ -1,18 +1,17 @@
+# Owner(s): ["module: dynamo"]
 """
 PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
 with test_adam in OptimizerTests)
 """
+
 import functools
 
-# Owner(s): ["module: dynamo"]
-
-
 import torch
-
 import torch._dynamo
 import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch.nn import Parameter
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 class MyOptimizer(torch.optim.Optimizer):
@@ -37,6 +36,8 @@ class MyOptimizer(torch.optim.Optimizer):
 
 
 class End2EndTests(torch._dynamo.test_case.TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     # https://github.com/pytorch/torchdynamo/issues/1604
     def test_optimizing_over_tensor_with_requires_grad(self):
         class Net(torch.nn.Module):
@@ -60,7 +61,7 @@ class End2EndTests(torch._dynamo.test_case.TestCase):
         optimizer = torch.optim.Adam([input2], lr=0.1)
 
         cnts = torch._dynamo.testing.CompileCounter()
-        opt_training_iter_fn = torch._dynamo.optimize(cnts)(training_iter_fn)
+        opt_training_iter_fn = torch.compile(training_iter_fn, backend=cnts)
         batch = {"x": input1, "y": input2}
         for _ in range(2):
             opt_training_iter_fn(batch, net, optimizer)
@@ -101,6 +102,32 @@ class End2EndTests(torch._dynamo.test_case.TestCase):
             opt_step()
 
             self.assertEqual(params, opt_params)
+
+    def test_stock_optimizer_init_group_after_disable_patch(self):
+        # TorchPatcher wraps stock Optimizer._init_group with compiler.disable.
+        # Compiling the inner step must still constant-fold _init_group via
+        # OptimizerVariable.tp_methods, not inline the disable wrapper.
+        torch._dynamo.eval_frame.TorchPatcher.patch()
+
+        # Adadelta is the inductor compiled-optimizer shard that failed; Adamax
+        # is the dynamo-wrapped test_optim case. Both wrap _init_group.
+        for opt_cls in (torch.optim.Adadelta, torch.optim.Adamax):
+            with self.subTest(opt_cls=opt_cls.__name__):
+                p = Parameter(torch.ones(2, 2), requires_grad=True)
+                opt = opt_cls([p])
+                p.grad = torch.ones_like(p)
+
+                step_fn = opt.step.__wrapped__.__wrapped__
+
+                @torch.compile(backend="eager", fullgraph=True)
+                def compiled_step():
+                    step_fn(opt)
+
+                before = p.detach().clone()
+                with torch.no_grad():
+                    compiled_step()
+                self.assertFalse(torch.equal(p, before))
+                torch._dynamo.reset()
 
 
 if __name__ == "__main__":

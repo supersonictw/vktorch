@@ -3,7 +3,7 @@
 #include <ATen/cuda/CUDAUtils.h>
 #include <ATen/Dispatch.h>
 
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
+#if defined(USE_ROCM) || defined(_MSC_VER)
 #else
 #include <cuda_runtime.h>
 #include <cutlass/cutlass.h>
@@ -16,7 +16,7 @@
 #include <type_traits>
 #include <tuple>
 
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
+#if defined(USE_ROCM) || defined(_MSC_VER)
 #else
 #define CUTLASS_STATUS_CHECK(status)                                      \
   {                                                                       \
@@ -31,7 +31,7 @@ namespace {
 
 namespace at::native {
 
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
+#if defined(USE_ROCM) || defined(_MSC_VER)
 #else
 // Wrapper function for CUTLASS sparse GEMM implementation, used
 // solely to simplify dispatching from
@@ -44,6 +44,7 @@ template <
     typename ThreadblockShape,
     typename WarpShape,
     typename InstructionShape,
+    typename Operator,
     typename LayoutInputA,
     typename LayoutInputB,
     bool use_bias,
@@ -62,7 +63,6 @@ Tensor two_four_sgemm(
     using SmArch = cutlass::arch::Sm80; // Only CC 8.x devices are supported at the moment.
     using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>; // This choice provides good performance across wide range of operand sizes.
     constexpr int NumStages = 3; // This choice provides good performance across wide range of operand sizes.
-    using Operator = cutlass::arch::OpMultiplyAdd;
     constexpr int NumEVTEpilogueStages = 1;
 
     constexpr int AlignmentInputA = 128 / cutlass::sizeof_bits<ElementInputA>::value;
@@ -75,12 +75,6 @@ Tensor two_four_sgemm(
     using LayoutC = LayoutOutput;
     constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
-    using BiasTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
-        ThreadblockShape,
-        WarpShape,
-        ElementC,
-        AlignmentC,
-        NumEVTEpilogueStages>;
     using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
         ThreadblockShape,
         WarpShape,
@@ -94,7 +88,7 @@ Tensor two_four_sgemm(
         cutlass::epilogue::threadblock::VisitorScalarBroadcast<ElementC>;
     using BiasTensor =
         cutlass::epilogue::threadblock::VisitorColBroadcast<
-            BiasTileThreadMap,
+            OutputTileThreadMap,
             ElementC,
             cute::Stride<cute::_1, cute::_0, int64_t>>;
     using Bias = std::conditional_t<use_bias, BiasTensor, BiasScalar>;
@@ -195,7 +189,7 @@ Tensor two_four_sgemm(
         meta_dtype = at::kInt;
         break;
     default:
-        AT_ERROR("two_four_sgemm: invalid size of meta tensor datatype "
+        TORCH_CHECK(false, "two_four_sgemm: invalid size of meta tensor datatype "
                  "encountered");
     }
     TORCH_CHECK(meta.dtype() == meta_dtype,
@@ -215,7 +209,7 @@ Tensor two_four_sgemm(
     } else if constexpr (std::is_same_v<ElementOutput, float>) {
         tensor_d_dtype = at::kFloat;
     } else {
-        AT_ERROR("two_four_sgemm: invalid datatype for sparse GEMM output ",
+        TORCH_CHECK(false, "two_four_sgemm: invalid datatype for sparse GEMM output ",
                  "encountered");
     }
     if constexpr (use_bias) {
@@ -251,7 +245,7 @@ Tensor two_four_sgemm(
                         ElementC(0),
                         {cute::_1{}, cute::_0{}, problem_size.m()}};
             } else {
-                return {ElementC(0)};
+                return {{ElementC(0)}};
             }
         }()
     };
@@ -317,6 +311,7 @@ template <
     typename ThreadblockShape,
     typename WarpShape,
     typename InstructionShape,
+    typename Operator,
     bool EnableRowMajorRowMajorLayouts,
     bool EnableRowMajorColumnMajorLayouts,
     bool EnableColumnMajorRowMajorLayouts,
@@ -345,6 +340,7 @@ Tensor two_four_sgemm_dispatch_layouts(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 cutlass::layout::RowMajor,
                 cutlass::layout::RowMajor,
                 use_bias,
@@ -367,6 +363,7 @@ Tensor two_four_sgemm_dispatch_layouts(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 cutlass::layout::RowMajor,
                 cutlass::layout::ColumnMajor,
                 use_bias,
@@ -389,6 +386,7 @@ Tensor two_four_sgemm_dispatch_layouts(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 cutlass::layout::ColumnMajor,
                 cutlass::layout::RowMajor,
                 use_bias,
@@ -411,6 +409,7 @@ Tensor two_four_sgemm_dispatch_layouts(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 cutlass::layout::ColumnMajor,
                 cutlass::layout::ColumnMajor,
                 use_bias,
@@ -424,7 +423,7 @@ Tensor two_four_sgemm_dispatch_layouts(
         }
     }
 
-    AT_ERROR("two_four_sgemm_dispatch_layouts: Combination of ",
+    TORCH_CHECK(false, "two_four_sgemm_dispatch_layouts: Combination of ",
              tensor_a_row_major ? "row-major" : "column_major", " and ",
              tensor_b_row_major ? "row-major" : "column_major",
              " layouts for input tensors is not supported");
@@ -440,6 +439,7 @@ template <
     typename ThreadblockShape,
     typename WarpShape,
     typename InstructionShape,
+    typename Operator,
     bool EnableRowMajorRowMajorLayouts,
     bool EnableRowMajorColumnMajorLayouts,
     bool EnableColumnMajorRowMajorLayouts,
@@ -457,6 +457,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias(
             ThreadblockShape,
             WarpShape,
             InstructionShape,
+            Operator,
             EnableRowMajorRowMajorLayouts,
             EnableRowMajorColumnMajorLayouts,
             EnableColumnMajorRowMajorLayouts,
@@ -476,6 +477,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias(
             ThreadblockShape,
             WarpShape,
             InstructionShape,
+            Operator,
             EnableRowMajorRowMajorLayouts,
             EnableRowMajorColumnMajorLayouts,
             EnableColumnMajorRowMajorLayouts,
@@ -498,6 +500,7 @@ template <
     typename ThreadblockShape,
     typename WarpShape,
     typename InstructionShape,
+    typename Operator,
     bool EnableRowMajorRowMajorLayouts,
     bool EnableRowMajorColumnMajorLayouts,
     bool EnableColumnMajorRowMajorLayouts,
@@ -507,7 +510,7 @@ template <
     bool EnableActivationSiLU>
 Tensor two_four_sgemm_dispatch_layouts_bias_activation(
     const Tensor& tensor_a, const Tensor& tensor_b, const Tensor& tensor_c,
-    const Tensor& meta, const c10::string_view& activation) {
+    const Tensor& meta, const std::string_view& activation) {
     // Perform dispatching.
     if constexpr (EnableActivationNone) {
         if (activation == "none") {
@@ -519,6 +522,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias_activation(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 EnableRowMajorRowMajorLayouts,
                 EnableRowMajorColumnMajorLayouts,
                 EnableColumnMajorRowMajorLayouts,
@@ -540,6 +544,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias_activation(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 EnableRowMajorRowMajorLayouts,
                 EnableRowMajorColumnMajorLayouts,
                 EnableColumnMajorRowMajorLayouts,
@@ -561,6 +566,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias_activation(
                 ThreadblockShape,
                 WarpShape,
                 InstructionShape,
+                Operator,
                 EnableRowMajorRowMajorLayouts,
                 EnableRowMajorColumnMajorLayouts,
                 EnableColumnMajorRowMajorLayouts,
@@ -573,7 +579,7 @@ Tensor two_four_sgemm_dispatch_layouts_bias_activation(
         }
     }
 
-    AT_ERROR("two_four_sgemm_dispatch_layouts: Activation \"", activation,
+    TORCH_CHECK(false, "two_four_sgemm_dispatch_layouts: Activation \"", activation,
              "\" is not supported for given input tensors");
     return Tensor{};
 }
@@ -600,11 +606,15 @@ Tensor two_four_sgemm_dispatch_layouts_bias_activation(
 // number of checks throughout the code.
 Tensor _sparse_semi_structured_linear(
       const Tensor& input, const Tensor& weight,
-      const Tensor& meta, const c10::optional<Tensor>& bias_opt,
-      const c10::optional<c10::string_view> activation_opt,
-      const c10::optional<c10::ScalarType> out_dtype_opt) {
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
-    AT_ERROR("_sparse_semi_structured_linear: CUTLASS not supported");
+      const Tensor& meta, const std::optional<Tensor>& bias_opt,
+      const std::optional<std::string_view> activation_opt,
+      const std::optional<c10::ScalarType> out_dtype_opt) {
+    TORCH_WARN_ONCE("_sparse_semi_structured_linear is deprecated and will be "
+                    "removed in a future PyTorch release.  Please use "
+                    "_sparse_semi_structured_mm/_sparse_semi_structured_addmm "
+                    "instead.");
+#if defined(USE_ROCM) || defined(_MSC_VER)
+    TORCH_CHECK(false, "_sparse_semi_structured_linear: CUTLASS not supported");
     return Tensor{};
 #else
     // No need to check that all tensors are on CUDA device, as this
@@ -713,6 +723,7 @@ Tensor _sparse_semi_structured_linear(
                     cutlass::gemm::GemmShape<128, 128, 128>;
                 using WarpShape = cutlass::gemm::GemmShape<64, 64, 128>;
                 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 64>;
+                using Operator = cutlass::arch::OpMultiplyAddSaturate;
                 const auto EnableRowMajorRowMajorLayouts = false;
                 const auto EnableRowMajorColumnMajorLayouts = true;
                 const auto EnableColumnMajorRowMajorLayouts = false;
@@ -730,6 +741,7 @@ Tensor _sparse_semi_structured_linear(
                       ThreadblockShape,
                       WarpShape,
                       InstructionShape,
+                      Operator,
                       EnableRowMajorRowMajorLayouts,
                       EnableRowMajorColumnMajorLayouts,
                       EnableColumnMajorRowMajorLayouts,
@@ -752,6 +764,7 @@ Tensor _sparse_semi_structured_linear(
                       ThreadblockShape,
                       WarpShape,
                       InstructionShape,
+                      Operator,
                       EnableRowMajorRowMajorLayouts,
                       EnableRowMajorColumnMajorLayouts,
                       EnableColumnMajorRowMajorLayouts,
@@ -777,6 +790,7 @@ Tensor _sparse_semi_structured_linear(
                 using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
                 using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
                 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+                using Operator = cutlass::arch::OpMultiplyAdd;
                 const auto EnableRowMajorRowMajorLayouts = true;
                 const auto EnableRowMajorColumnMajorLayouts = true;
                 const auto EnableColumnMajorRowMajorLayouts = true;
@@ -792,6 +806,7 @@ Tensor _sparse_semi_structured_linear(
                     ThreadblockShape,
                     WarpShape,
                     InstructionShape,
+                    Operator,
                     EnableRowMajorRowMajorLayouts,
                     EnableRowMajorColumnMajorLayouts,
                     EnableColumnMajorRowMajorLayouts,
@@ -816,6 +831,7 @@ Tensor _sparse_semi_structured_linear(
                 using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
                 using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
                 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+                using Operator = cutlass::arch::OpMultiplyAdd;
                 const auto EnableRowMajorRowMajorLayouts = true;
                 const auto EnableRowMajorColumnMajorLayouts = true;
                 const auto EnableColumnMajorRowMajorLayouts = true;
@@ -831,6 +847,7 @@ Tensor _sparse_semi_structured_linear(
                     ThreadblockShape,
                     WarpShape,
                     InstructionShape,
+                    Operator,
                     EnableRowMajorRowMajorLayouts,
                     EnableRowMajorColumnMajorLayouts,
                     EnableColumnMajorRowMajorLayouts,
@@ -855,6 +872,7 @@ Tensor _sparse_semi_structured_linear(
                 using ThreadblockShape = cutlass::gemm::GemmShape<128, 64, 32>;
                 using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
                 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+                using Operator = cutlass::arch::OpMultiplyAdd;
                 const auto EnableRowMajorRowMajorLayouts = true;
                 const auto EnableRowMajorColumnMajorLayouts = true;
                 const auto EnableColumnMajorRowMajorLayouts = true;
@@ -870,6 +888,7 @@ Tensor _sparse_semi_structured_linear(
                     ThreadblockShape,
                     WarpShape,
                     InstructionShape,
+                    Operator,
                     EnableRowMajorRowMajorLayouts,
                     EnableRowMajorColumnMajorLayouts,
                     EnableColumnMajorRowMajorLayouts,
@@ -893,177 +912,3 @@ Tensor _sparse_semi_structured_linear(
 }
 
 } // namespace at::native
-
-// Following is just for testing purposes.
-namespace at::native {
-
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
-#else
-// Copied from tools/util/include/host_reorder.h, from CUTLASS source
-// tree.  This is for simplicity - namely, this file is not under
-// include/cutlass in this tree, as other CUTLASS include files
-// needed, so it would require changing PyTorch CMake configuration;
-// furthermore, including this file produces build errors in PyTorch
-// at the moment.
-template <typename Element, typename LayoutDest, typename LayoutSrc>
-static void reorder_meta(cutlass::TensorRef<Element, LayoutDest> dest,
-                         cutlass::TensorRef<Element, LayoutSrc> src,
-                         const int problem_size_m, const int problem_size_k) {
-  for (int m = 0; m < problem_size_m; m++) {
-    for (int k = 0; k < problem_size_k; k++) {
-      // First reorder the rows.
-      int group = (sizeof(Element) == 2) ? 32 : 16;
-      int interweave = (sizeof(Element) == 2) ? 4 : 2;
-
-      int dest_row = m / group * group + (m % 8) * interweave + (m % group) / 8;
-      int dest_col = k;
-
-      // Next swizzle the 2x2 blocks from Z to N.
-      if (((dest_row % 2) == 0) && ((dest_col % 2) == 1)) {
-        ++dest_row;
-        --dest_col;
-      } else if (((dest_row % 2) == 1) && ((dest_col % 2) == 0)) {
-        --dest_row;
-        ++dest_col;
-      }
-
-      dest.at({dest_row, dest_col}) = src.at({m, k});
-    }
-  }
-}
-#endif
-
-std::tuple<Tensor, Tensor>
-_to_sparse_semi_structured(const Tensor& dense) {
-#if defined(USE_ROCM) || defined(_MSC_VER) || (defined(CUDA_VERSION) && CUDA_VERSION < 11080)
-  AT_ERROR("_to_sparse_semi_structured: CUTLASS not supported");
-  return std::make_tuple(Tensor{}, Tensor{});
-#else
-  // Check dimensions of the dense matrix.
-  TORCH_CHECK(dense.dim() == 2,
-              "_to_sparse_semi_structured: Expected dense argument to be 2D "
-              "tensor, got ", dense.dim(), " dims");
-
-  // Determine PyTorch datatype for the metadata matrix.
-  auto meta_dtype = at::kChar;
-  auto ksparse = 0;
-  auto dense_elems_per_meta_elem = 0;
-  if (dense.dtype() == at::kChar) {
-    meta_dtype = at::kInt;
-    ksparse = 4;
-    dense_elems_per_meta_elem = 32;
-  } else if (dense.dtype() == at::kHalf || dense.dtype() == at::kBFloat16) {
-    meta_dtype = at::kShort;
-    ksparse = 4;
-    dense_elems_per_meta_elem = 16;
-  } else if (dense.dtype() == at::kFloat) {
-    meta_dtype = at::kShort;
-    ksparse = 2;
-    dense_elems_per_meta_elem = 8;
-  } else {
-    AT_ERROR("_to_sparse_semi_structured: Invalid dense argument datatype ",
-             dense.dtype(), " encountered");
-  }
-
-  const auto dense_nrows = dense.size(0);
-  const auto dense_ncols = dense.size(1);
-
-  if (dense_nrows % (meta_dtype == at::kShort ? 32 : 16) != 0) {
-    AT_ERROR("_to_sparse_semi_structured: Number of rows of dense matrix must "
-             "be divisible by ", (meta_dtype == at::kShort ? 32 : 16),
-             ", but it is ", dense_nrows);
-  }
-  if (dense_ncols % dense_elems_per_meta_elem != 0) {
-    AT_ERROR("_to_sparse_semi_structured: Number of columns of dense matrix "
-             "must be divisible by ", dense_elems_per_meta_elem, ", but it is ",
-             dense_ncols);
-  }
-
-  const auto dense_cpu = dense.to("cpu");
-
-  const auto mask_cpu = dense_cpu != at::zeros({1}, dense_cpu.options());
-
-  const auto sparse_cpu =
-    dense_cpu.masked_select(mask_cpu).view({dense_nrows, dense_ncols / 2});
-
-  const auto meta_nrows = dense_nrows;
-  const auto meta_ncols = dense_ncols / dense_elems_per_meta_elem;
-  auto meta_cpu = dense_cpu.new_empty({meta_nrows, meta_ncols},
-                                      at::TensorOptions().dtype(meta_dtype));
-
-  auto* mask_cpu_ptr = mask_cpu.data_ptr<bool>();
-  for (auto i = 0; i < meta_nrows; ++i) {
-    for (auto j = 0; j < meta_ncols; ++j) {
-      uint64_t meta_val = 0;
-      for (auto k = 0; k < dense_elems_per_meta_elem / ksparse; ++k, mask_cpu_ptr += ksparse) {
-        const auto mask_elems =
-          (ksparse == 4) ? std::make_tuple(mask_cpu_ptr[0], mask_cpu_ptr[1],
-                                           mask_cpu_ptr[2], mask_cpu_ptr[3])
-                         : std::make_tuple(mask_cpu_ptr[0], mask_cpu_ptr[0],
-                                           mask_cpu_ptr[1], mask_cpu_ptr[1]);
-        auto meta_quadruple = 0;
-        if (mask_elems == std::make_tuple(1, 1, 0, 0)) {
-          meta_quadruple = 4; // 0100
-        } else if (mask_elems == std::make_tuple(1, 0, 1, 0)) {
-          meta_quadruple = 8; // 1000
-        } else if (mask_elems == std::make_tuple(0, 1, 1, 0)) {
-          meta_quadruple = 9; // 1001
-        } else if (mask_elems == std::make_tuple(1, 0, 0, 1)) {
-          meta_quadruple = 12; // 1100
-        } else if (mask_elems == std::make_tuple(0, 1, 0, 1)) {
-          meta_quadruple = 13; // 1101
-        } else if (mask_elems == std::make_tuple(0, 0, 1, 1)) {
-          meta_quadruple = 14; // 1110
-        } else {
-          AT_ERROR("_to_sparse_semi_structured: dense argument does not match ",
-                   (dense.dtype() != at::kFloat) ? "2:4" : "1:2",
-                   "sparsity pattern");
-        }
-        meta_val = meta_val | (meta_quadruple << (4 * k));
-      }
-      const auto idx = i * meta_ncols + j;
-      if (meta_dtype == at::kShort) {
-        using MetaElement = int16_t;
-        const auto meta_cpu_ptr = meta_cpu.data_ptr<MetaElement>();
-        meta_cpu_ptr[idx] = (MetaElement)meta_val;
-      } else if (meta_dtype == at::kInt) {
-        using MetaElement = int32_t;
-        const auto meta_cpu_ptr = meta_cpu.data_ptr<MetaElement>();
-        meta_cpu_ptr[idx] = (MetaElement)meta_val;
-      }
-    }
-  }
-
-  auto meta_reordered_cpu = meta_cpu.new_empty({meta_nrows, meta_ncols});
-  using MetaLayout = cutlass::layout::RowMajor;
-  using MetaReorderedLayout = cutlass::layout::ColumnMajorInterleaved<2>;
-  if (meta_dtype == at::kShort) {
-    using MetaElement = int16_t;
-    auto meta_cpu_ref =
-      cutlass::TensorRef<MetaElement, MetaLayout>(
-          meta_cpu.data_ptr<MetaElement>(),
-          MetaLayout::packed({meta_nrows, meta_ncols}));
-    auto meta_reordered_cpu_ref =
-      cutlass::TensorRef<MetaElement, MetaReorderedLayout>(
-          meta_reordered_cpu.data_ptr<MetaElement>(),
-          MetaReorderedLayout::packed({meta_nrows, meta_ncols}));
-    reorder_meta(meta_reordered_cpu_ref, meta_cpu_ref, meta_nrows, meta_ncols);
-  } else if (meta_dtype == at::kInt) {
-    using MetaElement = int32_t;
-    auto meta_cpu_ref =
-      cutlass::TensorRef<MetaElement, MetaLayout>(
-          meta_cpu.data_ptr<MetaElement>(),
-          MetaLayout::packed({meta_nrows, meta_ncols}));
-    auto meta_reordered_cpu_ref =
-      cutlass::TensorRef<MetaElement, MetaReorderedLayout>(
-          meta_reordered_cpu.data_ptr<MetaElement>(),
-          MetaReorderedLayout::packed({meta_nrows, meta_ncols}));
-    reorder_meta(meta_reordered_cpu_ref, meta_cpu_ref, meta_nrows, meta_ncols);
-  }
-
-  return std::make_tuple(sparse_cpu.to(dense.device()),
-                         meta_reordered_cpu.to(dense.device()));
-#endif
-}
-
-}  // namespace at::native

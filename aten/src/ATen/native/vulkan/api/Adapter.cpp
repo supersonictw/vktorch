@@ -44,10 +44,10 @@ PhysicalDevice::PhysicalDevice(VkPhysicalDevice physical_device_handle)
       handle, &queue_family_count, queue_families.data());
 
   // Find the total number of compute queues
-  for (const VkQueueFamilyProperties& properties : queue_families) {
+  for (const VkQueueFamilyProperties& p : queue_families) {
     // Check if this family has compute capability
-    if (properties.queueFlags & VK_QUEUE_COMPUTE_BIT) {
-      num_compute_queues += properties.queueCount;
+    if (p.queueFlags & VK_QUEUE_COMPUTE_BIT) {
+      num_compute_queues += p.queueCount;
     }
   }
 }
@@ -358,9 +358,9 @@ std::string Adapter::stringize() const {
   std::string device_type = get_device_type_str(properties.deviceType);
   VkPhysicalDeviceLimits limits = properties.limits;
 
-  ss << "{" << std::endl;
+  ss << '{' << std::endl;
   ss << "  Physical Device Info {" << std::endl;
-  ss << "    apiVersion:    " << v_major << "." << v_minor << std::endl;
+  ss << "    apiVersion:    " << v_major << '.' << v_minor << std::endl;
   ss << "    driverversion: " << properties.driverVersion << std::endl;
   ss << "    deviceType:    " << device_type << std::endl;
   ss << "    deviceName:    " << properties.deviceName << std::endl;
@@ -371,7 +371,7 @@ std::string Adapter::stringize() const {
 
 #define PRINT_LIMIT_PROP_VEC3(name)                                       \
   ss << "      " << std::left << std::setw(36) << #name << limits.name[0] \
-     << "," << limits.name[1] << "," << limits.name[2] << std::endl;
+     << ',' << limits.name[1] << ',' << limits.name[2] << std::endl;
 
   ss << "    Physical Device Limits {" << std::endl;
   PRINT_LIMIT_PROP(maxImageDimension1D);
@@ -425,9 +425,9 @@ std::string Adapter::stringize() const {
     ;
   }
   ss << "  ]" << std::endl;
-  ss << "}";
+  ss << '}';
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
 std::ostream& operator<<(std::ostream& os, const Adapter& adapter) {

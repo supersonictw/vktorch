@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import torch
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
 from torch.overrides import TorchFunctionMode
@@ -23,7 +24,10 @@ class AutogradStateOpsFailSafeguard(TorchFunctionMode):
         # any active PROXY. This is to allow the autograd ops out of tracing.
         current_state = torch._C.is_grad_enabled()
         if func in unsupported_grad_mode_ops:
-            assert len(args) == 1
+            if len(args) != 1:
+                raise AssertionError(
+                    f"Expected exactly 1 argument for grad mode op, but got {len(args)}"
+                )
             changed_state = args[0]
             mode = torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY)
             # Intend to check if it's not the pre_dispatch mode. It's allowed to use
@@ -37,6 +41,7 @@ class AutogradStateOpsFailSafeguard(TorchFunctionMode):
                 raise RuntimeError(
                     f"Encountered autograd state manager op {func} trying to change global autograd state "
                     "while exporting. This is unsafe because we don't capture this op in torch.export "
-                    "today, hence we can't reflect the user intention soundly."
+                    "today, hence we can't reflect the user intention soundly. You can fix this by "
+                    "adding a torch.no_grad() context around the export call."
                 )
         return func(*args, **kwargs)

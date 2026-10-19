@@ -46,7 +46,7 @@ If you are using [Visual Studio Code Remote - SSH](https://code.visualstudio.com
 
 ## Step 6: Open in DevContainer
 
-1. In VSCode, use the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P` on macOS) to run the "Remote-Containers: Open Folder in Container..." command.
+1. In VSCode, use the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P` on macOS) to run the "Dev Containers: Open Folder in Container..." command.
 2. You will be prompted with two options: CPU dev container or CUDA dev container. Choose the one you want to run.
 
 ## Step 7: Wait for Building the Environment
@@ -61,8 +61,8 @@ You are now all set to start developing with PyTorch in a DevContainer environme
 ## Step 8: Build PyTorch
 
 To build pytorch from source, simply run:
-   ```
-   python setup.py develop
+   ```bash
+   python -m pip install --no-build-isolation -v -e .
    ```
 
 The process involves compiling thousands of files, and would take a long time. Fortunately, the compiled objects can be useful for your next build. When you modify some files, you only need to compile the changed files the next time.
