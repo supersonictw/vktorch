@@ -15,27 +15,30 @@ namespace {
 // NOTE: are_expandable did a similar check, please keep them sync if change is needed
 template <typename Container, typename ArrayType>
 Container infer_size_impl(ArrayType a, ArrayType b) {
-  size_t dimsA = a.size();
-  size_t dimsB = b.size();
-  size_t ndim = dimsA > dimsB ? dimsA : dimsB;
+  // Use ptrdiff_t to ensure signed comparison.
+  auto dimsA = static_cast<ptrdiff_t>(a.size());
+  auto dimsB = static_cast<ptrdiff_t>(b.size());
+  auto ndim = dimsA > dimsB ? dimsA : dimsB;
   Container expandedSizes(ndim);
 
-  // Use ptrdiff_t to ensure signed comparison.
-  for (ptrdiff_t i = (ptrdiff_t)ndim - 1; i >= 0; --i) {
+  for (ptrdiff_t i = ndim - 1; i >= 0; --i) {
     ptrdiff_t offset = ndim - 1 - i;
     ptrdiff_t dimA = dimsA - 1 - offset;
     ptrdiff_t dimB = dimsB - 1 - offset;
     auto sizeA = (dimA >= 0) ? a[dimA] : 1;
     auto sizeB = (dimB >= 0) ? b[dimB] : 1;
 
-    TORCH_CHECK(
-        sizeA == sizeB || sizeA == 1 || sizeB == 1,
-        "The size of tensor a (", sizeA,
-        ") must match the size of tensor b (", sizeB,
-        ") at non-singleton dimension ", i);
-
-      // 1s map to the other size (even 0).
-      expandedSizes[i] = sizeA == 1 ? std::move(sizeB) : std::move(sizeA);
+    // If we know for sure one of them is 1, we are done.
+    // otherwise for unbacked we assume non-broadcasting path.
+    // Unbacked semantics should match python infer_size fake_impl.
+    if (!TORCH_GUARD_OR_FALSE(sym_eq(sizeA, 1)) && !TORCH_GUARD_OR_FALSE(sym_eq(sizeB, 1))) {
+      TORCH_MAYBE_SYM_CHECK(sym_eq(sizeA, sizeB),
+          "The size of tensor a (", sizeA,
+          ") must match the size of tensor b (", sizeB,
+          ") at non-singleton dimension ", i);
+    }
+    // 1s map to the other size (even 0).
+    expandedSizes[i] = TORCH_GUARD_OR_FALSE(sym_eq(sizeA, 1)) ? sizeB : sizeA;
   }
 
   return expandedSizes;
@@ -59,12 +62,12 @@ SymDimVector infer_size_symdimvector(SymIntArrayRef a, SymIntArrayRef b) {
 }
 
 template<typename Container>
-C10_ALWAYS_INLINE InferExpandGeometryResult<Container> inferExpandGeometryImpl(
+C10_ALWAYS_INLINE static InferExpandGeometryResult<Container> inferExpandGeometryImpl(
     IntArrayRef tensor_sizes,
     IntArrayRef tensor_strides,
     IntArrayRef sizes) {
-  int64_t ndim = sizes.size();
-  int64_t tensor_dim = tensor_sizes.size();
+  int64_t ndim = static_cast<int64_t>(sizes.size());
+  int64_t tensor_dim = static_cast<int64_t>(tensor_sizes.size());
 
   if (tensor_dim == 0) {
     return InferExpandGeometryResult<Container>(sizes, ndim);

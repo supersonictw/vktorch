@@ -47,10 +47,18 @@ TORCH_META_FUNC(nll_loss_forward)
   TORCH_CHECK(
       target.dim() <= 1,
       "0D or 1D target tensor expected, multi-target not supported");
-
-  auto no_batch_dim = self.dim() == 1  && target.dim() == 0;
   TORCH_CHECK(
-      no_batch_dim || (self.size(0) == target.size(0)),
+      target.scalar_type() == kLong || target.scalar_type() == kByte,
+      "expected target dtype to be Long or Byte, but got ",
+      target.scalar_type());
+  if (self.dim() == 1 && target.dim() == 1) {
+      TORCH_CHECK_VALUE(
+          target.size(0) == 1,
+          "For 1D input, 1D target must have size 1, but got target size: ",
+          target.size(0));
+  }
+  TORCH_CHECK(
+      self.dim() == 1 || (self.size(0) == target.size(0)),
       "size mismatch (got input: ",
       self.sizes(),
       ", target: ",
@@ -147,11 +155,15 @@ inline Tensor optional_contiguous(const Tensor& source) {
 // or nullptr if the tensor is undefined.
 template <typename scalar_t>
 inline scalar_t* optional_data(const Tensor& source) {
-  return source.defined() ? source.data_ptr<scalar_t>() : nullptr;
+  if constexpr (std::is_const_v<scalar_t>) {
+    return source.defined() ? source.const_data_ptr<scalar_t>() : nullptr;
+  } else {
+    return source.defined() ? source.mutable_data_ptr<scalar_t>() : nullptr;
+  }
 }
 
 template <typename scalar_t, typename target_t>
-static void nll_loss_out_frame(
+void nll_loss_out_frame(
     const Tensor& output,
     const Tensor& total_weight,
     const Tensor& input,
@@ -162,18 +174,18 @@ static void nll_loss_out_frame(
   const auto n_dims = input.dim();
   const auto n_classes = input.size(-1);
 
-  scalar_t* total_weight_data = total_weight.data_ptr<scalar_t>();
+  scalar_t* total_weight_data = total_weight.mutable_data_ptr<scalar_t>();
   *total_weight_data = 0;
 
   auto weight_contiguous = optional_contiguous(weight);
-  const scalar_t* weight_data = optional_data<scalar_t>(weight_contiguous);
+  const scalar_t* weight_data = optional_data<const scalar_t>(weight_contiguous);
 
   if (reduction == Reduction::None && n_dims == 2) {
     const auto batch_size = input.size(0);
     at::native::resize_output(output, {batch_size});
 
-    auto input_acc = input.accessor<scalar_t, 2>();
-    auto target_acc = target.accessor<target_t, 1>();
+    auto input_acc = input.accessor<const scalar_t, 2>();
+    auto target_acc = target.accessor<const target_t, 1>();
     auto output_acc = output.accessor<scalar_t, 1>();
 
     at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
@@ -219,15 +231,15 @@ static void nll_loss_out_frame(
   auto input_contiguous = input.contiguous();
   auto target_contiguous = target.contiguous();
 
-  const scalar_t* input_data = input_contiguous.data_ptr<scalar_t>();
-  const target_t* target_data = target_contiguous.data_ptr<target_t>();
+  const scalar_t* input_data = input_contiguous.const_data_ptr<scalar_t>();
+  const target_t* target_data = target_contiguous.const_data_ptr<target_t>();
 
   const int64_t ndim = input.dim();
   const int64_t batch_size = ndim == 1 ? 1 : input.size(0);
 
   constexpr int64_t cascade_sum_num_levels = 8;
   const int64_t level_power =
-      std::max(int64_t(4), utils::CeilLog2(batch_size) / cascade_sum_num_levels);
+      std::max(static_cast<int64_t>(4), utils::CeilLog2(batch_size) / cascade_sum_num_levels);
   const int64_t level_step = (1 << level_power);
   const int64_t level_mask = level_step - 1;
 
@@ -288,7 +300,7 @@ static void nll_loss_out_frame(
   }
 
   // write result to output tensors
-  *output.data_ptr<scalar_t>() = output_val;
+  *output.mutable_data_ptr<scalar_t>() = output_val;
   *total_weight_data = total_weight_val;
 }
 
@@ -300,8 +312,12 @@ void nll_loss_forward_out_cpu_template(
     const Tensor& weight,
     int64_t reduction,
     int64_t ignore_index) {
-  AT_DISPATCH_FLOATING_TYPES_AND(
-      ScalarType::BFloat16, input.scalar_type(), "nll_loss_out_frame", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      ScalarType::BFloat16,
+      ScalarType::Half,
+      input.scalar_type(),
+      "nll_loss_out_frame",
+      [&] {
         if (target.scalar_type() == kByte) {
           nll_loss_out_frame<scalar_t, uint8_t>(
               output,
@@ -326,7 +342,7 @@ void nll_loss_forward_out_cpu_template(
 }
 
 template <typename scalar_t, typename target_t>
-static void nll_loss_backward_out_frame(
+void nll_loss_backward_out_frame(
     const Tensor& grad_input,
     const Tensor& grad_output,
     const Tensor& input,
@@ -342,15 +358,15 @@ static void nll_loss_backward_out_frame(
   if (target.dim() == 0) {
     target_ = target.unsqueeze(0);
   }
-  auto target_acc = target_.accessor<target_t, 1>();
+  auto target_acc = target_.accessor<const target_t, 1>();
 
   auto weight_contiguous = optional_contiguous(weight);
-  const scalar_t* weight_data = optional_data<scalar_t>(weight_contiguous);
+  const scalar_t* weight_data = optional_data<const scalar_t>(weight_contiguous);
 
   if (reduction == Reduction::None && n_dims == 2) {
     const auto batch_size = input.size(0);
     auto grad_input_acc = grad_input.accessor<scalar_t, 2>();
-    auto grad_output_acc = grad_output.accessor<scalar_t, 1>();
+    auto grad_output_acc = grad_output.accessor<const scalar_t, 1>();
     at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
       for (const auto i : c10::irange(start, end)) {
         auto cur_target = target_acc[i];
@@ -365,9 +381,9 @@ static void nll_loss_backward_out_frame(
     return;
   }
 
-  const scalar_t total_weight_value = *total_weight.data_ptr<scalar_t>();
+  const scalar_t total_weight_value = *total_weight.const_data_ptr<scalar_t>();
 
-  const scalar_t grad_output_value = *grad_output.data_ptr<scalar_t>();
+  const scalar_t grad_output_value = *grad_output.const_data_ptr<scalar_t>();
 
   if (input.dim() == 1) {
     auto grad_input_acc = grad_input.accessor<scalar_t, 1>();
@@ -411,8 +427,9 @@ void nll_loss_backward_out_cpu_template(
     const Tensor& total_weight) {
   grad_input.zero_();
 
-  AT_DISPATCH_FLOATING_TYPES_AND(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::BFloat16,
+      ScalarType::Half,
       input.scalar_type(),
       "nll_loss_backward_out_frame",
       [&] {
@@ -485,14 +502,14 @@ static Tensor cross_entropy_loss_prob_target(
     int64_t reduction,
     double label_smoothing) {
   const auto class_dim = self.dim() == 1 ? 0 : 1;
-  const auto n_classes = self.size(class_dim);
+  const auto n_classes = self.sym_size(class_dim);
   TORCH_CHECK(
-      !weight.defined() || (weight.dim() == 1 && weight.numel() == n_classes),
+      !weight.defined() || (weight.dim() == 1 && weight.sym_numel() == n_classes),
       "cross_entropy: weight tensor should be defined either for all ",
       n_classes,
       " classes or no classes"
       " but got weight tensor of shape: ",
-      weight.sizes());
+      weight.sym_sizes());
 
   auto input = at::log_softmax(self, class_dim, self.scalar_type());
   Tensor target;
@@ -516,10 +533,10 @@ static Tensor cross_entropy_loss_prob_target(
 
     switch (reduction) {
       case Reduction::Mean:
-        if (input.numel()==0){
+        if (input.sym_numel()==0){
           return -(input * target * weight_).sum().fill_(std::numeric_limits<double>::quiet_NaN());
         } else {
-          return -(input * target * weight_).sum() / (input.numel() / n_classes);
+          return -(input * target * weight_).sum() / (input.sym_numel() / n_classes);
         }
       case Reduction::Sum:
         return -(input * target * weight_).sum();
@@ -531,10 +548,10 @@ static Tensor cross_entropy_loss_prob_target(
   } else {
     switch (reduction) {
       case Reduction::Mean:
-        if (input.numel()==0){
+        if (input.sym_numel()==0){
           return -(input * target).sum().fill_(std::numeric_limits<double>::quiet_NaN());
         } else {
-          return -(input * target).sum() / (input.numel() / n_classes);
+          return -(input * target).sum() / (input.sym_numel() / n_classes);
         }
       case Reduction::Sum:
         return -(input * target).sum();
@@ -604,7 +621,7 @@ static Tensor cross_entropy_loss_label_smoothing(
         ret = smooth_loss.sum();
         break;
       case Reduction::None:
-        ret = smooth_loss;
+        ret = std::move(smooth_loss);
         break;
       default:
         TORCH_CHECK(false, "Invalid reduction type encountered in cross_entropy: ", reduction);
@@ -615,7 +632,7 @@ static Tensor cross_entropy_loss_label_smoothing(
 Tensor cross_entropy_loss_symint(
     const Tensor& self,
     const Tensor& target,
-    const c10::optional<Tensor>& weight,
+    const std::optional<Tensor>& weight,
     int64_t reduction,
     c10::SymInt ignore_index,
     double label_smoothing) {
@@ -649,36 +666,19 @@ Tensor cross_entropy_loss_symint(
   return ret;
 }
 
-Tensor & nll_loss_out(const Tensor & self, const Tensor & target, const c10::optional<Tensor>& weight_opt, int64_t reduction, int64_t ignore_index, Tensor & output) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
+Tensor & nll_loss_out(const Tensor & self, const Tensor & target, const std::optional<Tensor>& weight_opt, int64_t reduction, int64_t ignore_index, Tensor & output) {
   Tensor total_weight = at::empty({0}, self.options());
-  return std::get<0>(at::nll_loss_forward_out(output, total_weight, self, target, weight, reduction, ignore_index));
+  return std::get<0>(at::nll_loss_forward_out(output, total_weight, self, target, weight_opt, reduction, ignore_index));
 }
 
-Tensor nll_loss_symint(const Tensor & self, const Tensor & target, const c10::optional<Tensor>& weight_opt, int64_t reduction, c10::SymInt ignore_index) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
-  return std::get<0>(at::nll_loss_forward_symint(self, target, weight, reduction, std::move(ignore_index)));
-}
-
-// Duplicate of above code for non-symbolic ints. Kept for BC purposes and to minimize breakages.
-static Tensor nll_loss(const Tensor & self, const Tensor & target, const c10::optional<Tensor>& weight_opt, int64_t reduction, int64_t ignore_index) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
-  return std::get<0>(at::nll_loss_forward_symint(self, target, weight, reduction, ignore_index));
+Tensor nll_loss_symint(const Tensor & self, const Tensor & target, const std::optional<Tensor>& weight_opt, int64_t reduction, c10::SymInt ignore_index) {
+  return std::get<0>(at::nll_loss_forward_symint(self, target, weight_opt, reduction, std::move(ignore_index)));
 }
 
 Tensor nll_loss_nd_symint(
     const Tensor& self,
     const Tensor& target,
-    const c10::optional<Tensor>& weight,
+    const std::optional<Tensor>& weight,
     int64_t reduction,
     c10::SymInt ignore_index) {
   if (self.dim() < 1) {
@@ -686,9 +686,21 @@ Tensor nll_loss_nd_symint(
         false, "Expected 1 or more dimensions (got ", self.dim(), ")");
   }
 
-  if (self.dim() != 1 && self.sym_sizes()[0] != target.sym_sizes()[0]) {
-    TORCH_CHECK_VALUE(
-        false,
+  if (self.dim() != 1) {
+    auto sizes_match = self.sym_sizes()[0].sym_eq(target.sym_sizes()[0]);
+    if (TORCH_GUARD_OR_FALSE(sizes_match.sym_not())) {
+      // Statically known mismatch - raise ValueError for eager mode
+      TORCH_CHECK_VALUE(
+          false,
+          "Expected input batch_size (",
+          self.sym_sizes()[0],
+          ") to match target batch_size (",
+          target.sym_sizes()[0],
+          ").");
+    }
+    // For unbacked symbolic shapes, emit runtime check.
+    TORCH_SYM_CHECK(
+        sizes_match,
         "Expected input batch_size (",
         self.sym_sizes()[0],
         ") to match target batch_size (",
@@ -720,12 +732,12 @@ Tensor nll_loss_nd_symint(
     input_ = input_.contiguous();
     target_ = target_.contiguous();
     // support empty batches, see #15870
-    if (input_.numel() > 0) {
+    if (input_.sym_numel() > 0) {
       input_ = input_.view_symint({n, std::move(c), 1, -1});
     } else {
       input_ = input_.view_symint({n, std::move(c), 0, 0});
     }
-    if (target_.numel() > 0) {
+    if (target_.sym_numel() > 0) {
       target_ = target_.view_symint({std::move(n), 1, -1});
     } else {
       target_ = target_.view_symint({std::move(n), 0, 0});

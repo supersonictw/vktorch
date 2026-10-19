@@ -115,8 +115,10 @@ std::unique_ptr<StaticRuntimeTestContext> makeTestContext(
     const std::string& source) {
   try {
     return std::make_unique<ModuleStaticRuntimeTestContext>(source);
-    // Could not parse as TorchScript, assume it's IR
-  } catch (const std::runtime_error&) {
+    // Could not parse as TorchScript, assume it's IR. The parser raises
+    // c10::Error, which derives from std::exception but not from
+    // std::runtime_error.
+  } catch (const std::exception&) {
     return std::make_unique<GraphStaticRuntimeContext>(source);
   }
 }
@@ -353,7 +355,7 @@ void testStaticRuntime(
 
           size_t new_managed_bytes =
               memory_planner ? memory_planner->total_managed() : 0;
-          if (check_resize && new_managed_bytes >= 0) {
+          if (check_resize) {
             EXPECT_GE(new_managed_bytes, managed_bytes);
           }
 

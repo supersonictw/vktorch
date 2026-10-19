@@ -1,19 +1,22 @@
 #pragma once
 
-#include <stack>
-
 #include <c10/core/InferenceMode.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/util/Exception.h>
 #include <c10/util/ThreadLocalDebugInfo.h>
 
 #include <ATen/FuncTorchTLS.h>
+#include <ATen/NodeCreationHooks.h>
 #include <ATen/PythonTorchFunctionTLS.h>
 #include <ATen/SavedTensorHooks.h>
 #include <ATen/ThreadLocalPythonObjects.h>
 #include <ATen/record_function.h>
 #include <c10/core/impl/PythonDispatcherTLS.h>
 #include <c10/core/impl/TorchDispatchModeTLS.h>
+
+namespace c10 {
+struct FakeTensorMode;
+}
 
 namespace at {
 
@@ -30,6 +33,7 @@ class TORCH_API ThreadLocalState {
   //  the current state object. This is used for example in the
   //  autograd engine.
   void set_grad_mode(bool enabled);
+  bool get_grad_mode() const;
 
   // set_multithreading_enabled - force the value of the multithreadinmaximum
   // threads TLS in
@@ -43,6 +47,8 @@ class TORCH_API ThreadLocalState {
 
  private:
   c10::impl::LocalDispatchKeySet dispatch_key_;
+
+  std::shared_ptr<c10::FakeTensorMode> fake_tensor_mode_state_;
 
   // ThreadLocalDebugInfo does not change after being created
   // with DebugInfoGuard
@@ -75,10 +81,22 @@ class TORCH_API ThreadLocalState {
   // TLS for saved tensors default hooks
   at::impl::SavedTensorDefaultHooksTLS saved_tensors_default_hooks_state_;
 
+  // TLS for node creation hooks
+  at::impl::NodeCreationHooksTLS node_creation_hooks_state_;
+
   bool functionalization_reapply_views_state_;
+
+  bool dtensor_allow_implicit_replication_;
 
   // TLS for arbitrary python objects that is registered via hooks
   at::impl::ThreadLocalPythonObjects saved_objects_;
+
+#if !defined(CAFFE2_IS_XPLAT_BUILD) && !defined(C10_MOBILE) && \
+    !defined(BUILD_LITE_INTERPRETER)
+  // TLS for autocast dtypes
+  std::array<at::ScalarType, at::COMPILE_TIME_MAX_DEVICE_TYPES>
+      autocast_dtypes_{};
+#endif
 
   friend class ThreadLocalStateGuard;
 };
@@ -91,6 +109,10 @@ class TORCH_API ThreadLocalStateGuard {
     // set the given state across the thread boundary
     ThreadLocalState::setThreadLocalState(state);
   }
+  ThreadLocalStateGuard(ThreadLocalStateGuard&& other) = delete;
+  ThreadLocalStateGuard(const ThreadLocalStateGuard&) = delete;
+  ThreadLocalStateGuard& operator=(const ThreadLocalStateGuard&) = delete;
+  ThreadLocalStateGuard& operator=(ThreadLocalStateGuard&&) = delete;
 
   ~ThreadLocalStateGuard() {
     // restore previously set variables
@@ -98,6 +120,7 @@ class TORCH_API ThreadLocalStateGuard {
   }
 
  private:
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const ThreadLocalState prev_state_;
 };
 

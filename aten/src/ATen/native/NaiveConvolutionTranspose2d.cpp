@@ -13,10 +13,8 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/empty.h>
-#include <ATen/ops/ones.h>
 #include <ATen/ops/slow_conv_transpose2d_native.h>
 #include <ATen/ops/sum.h>
-#include <ATen/ops/zeros.h>
 #endif
 
 #include <c10/core/TensorOptions.h>
@@ -24,7 +22,7 @@
 
 namespace at {
 namespace {
-static inline void slow_conv_transpose2d_shape_check(
+inline void slow_conv_transpose2d_shape_check(
     const Tensor& input,
     const Tensor& grad_output,
     const Tensor& weight,
@@ -85,7 +83,7 @@ static inline void slow_conv_transpose2d_shape_check(
       check_dim_size(bias, 1, 0, weight.size(1));
     }
   } else if (!weight_nullable) {
-    AT_ERROR("weight tensor is expected to be non-nullable");
+    TORCH_CHECK(false, "weight tensor is expected to be non-nullable");
   }
 
   int ndim = input.dim();
@@ -112,7 +110,7 @@ static inline void slow_conv_transpose2d_shape_check(
       (dilation_width * (kernel_width - 1) + 1) + output_padding_width;
 
   if (output_width < 1 || output_height < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given input size per channel: (",
         input_height,
         " x ",
@@ -298,6 +296,9 @@ void slow_conv_transpose2d_out_cpu_template(
   }
   columns.zero_();
 
+  // Materialize if COW, since we cannot do so during parallel_for
+  output.mutable_data_ptr();
+
   AT_DISPATCH_FLOATING_TYPES_AND3(at::ScalarType::Long, at::ScalarType::BFloat16,
       at::ScalarType::Half, input.scalar_type(), "slow_conv_transpose2d_out_cpu", [&] {
 
@@ -353,7 +354,7 @@ void slow_conv_transpose2d_out_cpu_template(
 
         // Unpack columns back into input:
         col2im<scalar_t>(
-            columns_n.data_ptr<scalar_t>(),
+            columns_n.const_data_ptr<scalar_t>(),
             n_output_plane,
             output_height,
             output_width,
@@ -367,7 +368,7 @@ void slow_conv_transpose2d_out_cpu_template(
             stride_width,
             dilation_height,
             dilation_width,
-            output_n.data_ptr<scalar_t>(),
+            output_n.mutable_data_ptr<scalar_t>(),
             use_channels_last);
       }
     });
@@ -383,7 +384,7 @@ void slow_conv_transpose2d_out_cpu_template(
   }
 }
 
-static void slow_conv_transpose2d_backward_out_cpu_template(
+void slow_conv_transpose2d_backward_out_cpu_template(
     const Tensor& input_,
     const Tensor& grad_output_,
     Tensor& grad_input,
@@ -508,7 +509,7 @@ static void slow_conv_transpose2d_backward_out_cpu_template(
           if (need_columns) {
             // Extract columns:
             im2col<scalar_t>(
-                  grad_output_n.data_ptr<scalar_t>(),
+                  grad_output_n.const_data_ptr<scalar_t>(),
                   n_output_plane,
                   output_height,
                   output_width,
@@ -522,12 +523,12 @@ static void slow_conv_transpose2d_backward_out_cpu_template(
                   stride_width,
                   dilation_height,
                   dilation_width,
-                  grad_columns.data_ptr<scalar_t>(),
+                  grad_columns.mutable_data_ptr<scalar_t>(),
                   use_channels_last);
           }
 
-          auto gemm_in_ptr = need_columns ? grad_columns.data_ptr<scalar_t>()
-              : grad_output_n.data_ptr<scalar_t>();
+          auto gemm_in_ptr = need_columns ? grad_columns.const_data_ptr<scalar_t>()
+              : grad_output_n.const_data_ptr<scalar_t>();
 
           if (use_channels_last) {
             int64_t m = n_input_plane;
@@ -706,7 +707,7 @@ void slow_conv_transpose2d_acc_grad_parameters_cpu(
             if (need_columns) {
               // Extract columns:
               im2col<scalar_t>(
-                  grad_output_n.data_ptr<scalar_t>(),
+                  grad_output_n.const_data_ptr<scalar_t>(),
                   n_output_plane,
                   output_height,
                   output_width,
@@ -720,12 +721,12 @@ void slow_conv_transpose2d_acc_grad_parameters_cpu(
                   stride_width,
                   dilation_height,
                   dilation_width,
-                  columns.data_ptr<scalar_t>(),
+                  columns.mutable_data_ptr<scalar_t>(),
                   use_channels_last);
             }
 
-            auto gemm_in_ptr = need_columns ? columns.data_ptr<scalar_t>()
-                : grad_output_n.data_ptr<scalar_t>();
+            auto gemm_in_ptr = need_columns ? columns.const_data_ptr<scalar_t>()
+                : grad_output_n.const_data_ptr<scalar_t>();
 
             if (use_channels_last) {
               int64_t m = kernel_height * kernel_width * n_output_plane;
@@ -799,55 +800,6 @@ TORCH_IMPL_FUNC(slow_conv_transpose2d_structured_cpu)
       dilation);
  }
 
-static std::tuple<Tensor&, Tensor&, Tensor&> slow_conv_transpose2d_backward_out_cpu(const Tensor& grad_output,
-    const Tensor& input,
-    const Tensor& weight,
-    IntArrayRef kernel_size,
-    IntArrayRef stride,
-    IntArrayRef padding,
-    IntArrayRef output_padding,
-    IntArrayRef dilation,
-    Tensor& grad_input,
-    Tensor& grad_weight,
-    Tensor& grad_bias) {
-  if (grad_input.defined()) {
-    slow_conv_transpose2d_backward_out_cpu_template(
-        input,
-        grad_output,
-        grad_input,
-        weight,
-        kernel_size,
-        stride,
-        padding,
-        output_padding,
-        dilation);
-  }
-
-  if (grad_bias.defined()) {
-    at::sum_out(grad_bias, grad_output, IntArrayRef{0, 2, 3});
-  }
-
-  if (grad_weight.defined()) {
-    grad_weight.resize_(weight.sizes(), weight.suggest_memory_format());
-    grad_weight.zero_();
-    slow_conv_transpose2d_acc_grad_parameters_cpu(
-        input,
-        weight,
-        grad_output,
-        grad_weight,
-        grad_bias,
-        kernel_size,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        1);
-  }
-
-  return std::tuple<Tensor&, Tensor&, Tensor&>(
-      grad_input, grad_weight, grad_bias);
-}
-
 static std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose2d_backward_cpu(
     const Tensor& grad_output,
     const Tensor& input,
@@ -914,10 +866,10 @@ static std::tuple<Tensor, Tensor, Tensor> slow_conv_transpose2d_backward_cpu(
         1);
   }
 
-  return std::tuple<Tensor, Tensor, Tensor>(grad_input, grad_weight, grad_bias);
+  return std::tuple<Tensor, Tensor, Tensor>(std::move(grad_input), std::move(grad_weight), std::move(grad_bias));
 }
 
-REGISTER_ALL_CPU_DISPATCH(slow_conv_transpose2d_backward_stub, &slow_conv_transpose2d_backward_cpu);
+REGISTER_ALL_CPU_DISPATCH(slow_conv_transpose2d_backward_stub, &slow_conv_transpose2d_backward_cpu)
 
 } // namespace native
 } // namespace at

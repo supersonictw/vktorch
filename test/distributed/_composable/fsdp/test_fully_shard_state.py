@@ -1,21 +1,20 @@
 # Owner(s): ["oncall: distributed"]
 
 import copy
-import unittest
 
 import torch.nn as nn
-from torch.distributed._composable.fsdp import FSDP, fully_shard
-from torch.testing._internal.common_cuda import TEST_CUDA
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.testing._internal.common_fsdp import FSDPTestMultiThread, MLP
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import HardwareClassification, run_tests
 
 
 class TestFullyShardState(FSDPTestMultiThread):
+    hw_classification = HardwareClassification.GENERIC
+
     @property
     def world_size(self) -> int:
         return 1
 
-    @unittest.skipIf(not TEST_CUDA, "no cuda")
     def test_fully_shard_state(self):
         """
         Tests the ability to get the state object from a fully sharded module.
@@ -31,7 +30,6 @@ class TestFullyShardState(FSDPTestMultiThread):
         # Check that each `fully_shard` call constructs a distinct state object
         self.assertEqual(len(set(all_states)), num_mlps + 1)
 
-    @unittest.skipIf(not TEST_CUDA, "no cuda")
     def test_fully_shard_reapply(self):
         model = MLP(8)
         fully_shard(model)
@@ -41,30 +39,28 @@ class TestFullyShardState(FSDPTestMultiThread):
         ):
             fully_shard(model)
 
-    @unittest.skipIf(not TEST_CUDA, "no cuda")
     def test_fully_shard_cls(self):
         # Check that we only swap class for the module passed to `fully_shard`
         model = MLP(8)
         fully_shard(model)
         self.assertTrue(isinstance(model, MLP))
-        self.assertTrue(isinstance(model, FSDP))
+        self.assertTrue(isinstance(model, FSDPModule))
         self.assertEqual(model.__class__.__name__, "FSDPMLP")
         for module in model.modules():
             if module is model:
                 continue
-            self.assertFalse(isinstance(module, FSDP))
+            self.assertFalse(isinstance(module, FSDPModule))
 
         # Check that slicing into a `Sequential` does not preserve FSDP
         model = nn.Sequential(*[MLP(8) for _ in range(3)])
         fully_shard(model)
         self.assertTrue(isinstance(model, nn.Sequential))
-        self.assertTrue(isinstance(model, FSDP))
+        self.assertTrue(isinstance(model, FSDPModule))
         self.assertEqual(model.__class__.__name__, "FSDPSequential")
         sliced_model = model[:2]
         self.assertTrue(isinstance(sliced_model, nn.Sequential))
-        self.assertFalse(isinstance(sliced_model, FSDP))
+        self.assertFalse(isinstance(sliced_model, FSDPModule))
 
-    @unittest.skipIf(not TEST_CUDA, "no cuda")
     def test_fully_shard_unsupported_module_cls(self):
         regex = (
             r"fully\_shard does not support containers that do not implement forward"
@@ -76,7 +72,6 @@ class TestFullyShardState(FSDPTestMultiThread):
         with self.assertRaisesRegex(ValueError, regex):
             fully_shard(model)
 
-    @unittest.skipIf(not TEST_CUDA, "no cuda")
     def test_fully_shard_deepcopy(self):
         model = MLP(8)
         fully_shard(model)

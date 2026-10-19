@@ -1,19 +1,25 @@
 # Owner(s): ["module: functorch"]
 
-import torch
-import torch.nn as nn
-import torch.fx as fx
-from functorch import make_fx
-from torch.nn import functional as F
-from functorch.compile import memory_efficient_fusion
-from torch._functorch.compile_utils import fx_graph_cse
-from torch.testing._internal.common_utils import TestCase, run_tests
 import inspect
 import random
-from typing import Callable
-import unittest
+from collections.abc import Callable
 
-HAS_CUDA = torch.cuda.is_available()
+import torch
+import torch.fx as fx
+import torch.nn as nn
+from functorch import make_fx
+from functorch.compile import memory_efficient_fusion
+from torch._functorch.compile_utils import fx_graph_cse
+from torch.nn import functional as F
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    onlyAccelerator,
+)
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 def _num_args(fn: Callable):
@@ -94,15 +100,17 @@ def hard_mish(x):
 # evo_norm_inp = [(128, 2048, 8, 8)]
 
 
-def run_and_compare_activation(self, fn, inps):
+def run_and_compare_activation(self, device, fn, inps):
     with torch.jit.fuser("fuser1"):
-        device = "cuda"
         dtype = torch.float
         if isinstance(fn, nn.Module):
             fn = fn.to(device=device, dtype=dtype)
 
-        ref_args = [torch.randn(shape, device=device, dtype=dtype, requires_grad=True) for shape in inps]
-        res_args = [i.clone().detach().requires_grad_(True) for i in ref_args]
+        ref_args = [
+            torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+            for shape in inps
+        ]
+        res_args = [i.detach().clone().requires_grad_(True) for i in ref_args]
 
         ref = fn(*ref_args)
         ref.sum().backward()
@@ -119,40 +127,48 @@ def run_and_compare_activation(self, fn, inps):
             self.assertEqual(ref_arg.grad, res_arg.grad)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-class TestMemoryEfficientOpAuthoring(TestCase):
-    def test_gelu_bias(self):
-        run_and_compare_activation(self, gelu_bias, [(1024,), (1024,)])
+class TestMemoryEfficientOpAuthoringDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
 
-    def test_mish(self):
-        run_and_compare_activation(self, mish, [(1024,)])
+    @onlyAccelerator
+    def test_gelu_bias(self, device):
+        run_and_compare_activation(self, device, gelu_bias, [(1024,), (1024,)])
 
-    def test_swish(self):
-        run_and_compare_activation(self, swish, [(1024,)])
+    @onlyAccelerator
+    def test_mish(self, device):
+        run_and_compare_activation(self, device, mish, [(1024,)])
 
-    def test_hard_sigmoid(self):
-        run_and_compare_activation(self, hard_sigmoid, [(1024,)])
+    @onlyAccelerator
+    def test_swish(self, device):
+        run_and_compare_activation(self, device, swish, [(1024,)])
 
-    def test_hard_swish(self):
-        run_and_compare_activation(self, hard_swish, [(1024,)])
+    @onlyAccelerator
+    def test_hard_sigmoid(self, device):
+        run_and_compare_activation(self, device, hard_sigmoid, [(1024,)])
 
-    def test_layer_norm(self):
+    @onlyAccelerator
+    def test_hard_swish(self, device):
+        run_and_compare_activation(self, device, hard_swish, [(1024,)])
+
+    @onlyAccelerator
+    def test_layer_norm(self, device):
         def layer_norm(x, weight, bias):
             dim = -1
             eps = 1e-5
             mean = torch.mean(x, dim, keepdim=True)
             centered = x - mean
             var = torch.sum(centered * centered, dim, keepdim=True) / x.size(-1)
-            rvar = 1. / torch.sqrt(var + eps)
+            rvar = 1.0 / torch.sqrt(var + eps)
             normed = (x - mean) * rvar
             return normed * weight + bias
 
         bs = 10
         ln_size = 16
         layer_norm_inps = [(bs, ln_size), (ln_size,), (ln_size,)]
-        run_and_compare_activation(self, layer_norm, layer_norm_inps)
+        run_and_compare_activation(self, device, layer_norm, layer_norm_inps)
 
-    def test_rmsnorm(self):
+    @onlyAccelerator
+    def test_rmsnorm(self, device):
         class T5LayerNorm(nn.Module):
             def __init__(self, hidden_size, eps=1e-6):
                 """
@@ -165,19 +181,22 @@ class TestMemoryEfficientOpAuthoring(TestCase):
             def forward(self, hidden_states):
                 # layer norm should always be calculated in float32
                 variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-                hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+                hidden_states = hidden_states * torch.rsqrt(
+                    variance + self.variance_epsilon
+                )
 
                 # convert into half-precision if necessary
                 if self.weight.dtype in [torch.float16, torch.bfloat16]:
                     hidden_states = hidden_states.to(self.weight.dtype)
 
                 return self.weight * hidden_states
+
         bs = 256
         seq = 256
         hidden = 1024
         t5_norm = T5LayerNorm(hidden)
         t5_norm_inputs = [(bs, seq, hidden)]
-        run_and_compare_activation(self, t5_norm, t5_norm_inputs)
+        run_and_compare_activation(self, device, t5_norm, t5_norm_inputs)
 
     # TODO - Assertion failure
     # def test_hard_mish(self):
@@ -200,30 +219,40 @@ def check(f, t, delta, check_val=True, graph_input=False):
     old_num_nodes = len(fx_g.graph.nodes)
     new_num_nodes = len(new_graph.nodes)
     if delta == -1:
-        assert old_num_nodes >= new_num_nodes, (
-            f"number of nodes increased {old_num_nodes}, {new_num_nodes}")
+        if old_num_nodes < new_num_nodes:
+            raise AssertionError(
+                f"number of nodes increased {old_num_nodes}, {new_num_nodes}"
+            )
     else:
-        assert old_num_nodes == new_num_nodes + delta, (
-            f"number of nodes not the same {old_num_nodes - delta}, {new_num_nodes}\n {fx_g.graph} \n {new_graph}")
+        if old_num_nodes != new_num_nodes + delta:
+            raise AssertionError(
+                f"number of nodes not the same {old_num_nodes - delta}, {new_num_nodes}\n {fx_g.graph} \n {new_graph}"
+            )
 
     # a second pass should not reduce more nodes
     pass_2_graph = fx_graph_cse(new_graph)
     pass_2_num_nodes = len(pass_2_graph.nodes)
-    assert pass_2_num_nodes == new_num_nodes, (
-        f"second pass graph has less node {pass_2_num_nodes}, {new_num_nodes}\n {new_graph} \n {pass_2_graph}")
+    if pass_2_num_nodes != new_num_nodes:
+        raise AssertionError(
+            f"second pass graph has less node {pass_2_num_nodes}, {new_num_nodes}\n {new_graph} \n {pass_2_graph}"
+        )
 
     # check correctness
     if check_val:
         true_result = fx_g(t)
         our_result = new_g(t)
         if true_result is None:  # both return None
-            assert our_result is None, f"true result is None, CSE result is {our_result}"
+            if our_result is not None:
+                raise AssertionError(f"true result is None, CSE result is {our_result}")
         else:  # results returned are the same
-            assert torch.all(true_result == our_result), (
-                f"results are different {true_result}, {our_result}")  # check results are the same
+            if not torch.all(true_result == our_result):
+                raise AssertionError(
+                    f"results are different {true_result}, {our_result}"
+                )
 
 
 class NoChangeTestCase(TestCase):
+    hw_classification = HardwareClassification.GENERIC
 
     def test_nochange(self):
         def f(x):
@@ -232,12 +261,14 @@ class NoChangeTestCase(TestCase):
             a = x
             d = x + a
             return b + d
+
         t = torch.randn(2, 2)
         check(f, t, 0)
 
     def test_empty(self):
         def f(x):
             pass
+
         t = torch.randn(2, 2)
         check(f, t, 0)
 
@@ -246,6 +277,7 @@ class NoChangeTestCase(TestCase):
             a = torch.rand_like(x)
             b = torch.rand_like(x)
             return a + b
+
         t = torch.randn(2, 2)
         check(f, t, 0, check_val=False)
 
@@ -254,6 +286,7 @@ class NoChangeTestCase(TestCase):
             a = torch.randn(4)
             b = torch.randn(4)
             return a + b
+
         t = torch.randn(2, 2)
         check(f, t, 0, check_val=False)
 
@@ -284,12 +317,42 @@ class NoChangeTestCase(TestCase):
 
         t = torch.rand(3, 100)
         _ = fn(t, 50)
-        assert len(gms) == 1, gms
+        if len(gms) != 1:
+            raise AssertionError(f"Expected 1 graph module, got {len(gms)}: {gms}")
         fx_g = gms[0]
         check(fx_g, None, 0, check_val=False, graph_input=True)
 
+    def test_neg_nan_not_merged(self):
+        def f(x):
+            a = torch.full_like(x, float("nan"))
+            b = torch.full_like(x, -float("nan"))
+            return a + b
+
+        t = torch.randn(2, 2)
+        check(f, t, 0, check_val=False)
+
+    def test_neg_zero_not_merged(self):
+        def f(x):
+            a = torch.full_like(x, 0.0)
+            b = torch.full_like(x, -0.0)
+            return torch.stack([a.reciprocal(), b.reciprocal()])
+
+        t = torch.randn(2, 2)
+        check(f, t, 0)
+
+    def test_complex_neg_zero_not_merged(self):
+        def f(x):
+            y = x.to(torch.cfloat)
+            a = torch.full_like(y, complex(0.0, 0.0))
+            b = torch.full_like(y, complex(-0.0, 0.0))
+            return torch.stack([a.real.reciprocal(), b.real.reciprocal()])
+
+        t = torch.randn(2, 2)
+        check(f, t, 0)
+
 
 class ReduceTestCase(TestCase):
+    hw_classification = HardwareClassification.GENERIC
 
     def test_immutable_list_type(self):
         def f(x):
@@ -298,6 +361,7 @@ class ReduceTestCase(TestCase):
             c = x.sum()
             d = x.sum()
             return a + b + c + d
+
         t = torch.randn(2, 2)
         check(f, t, 2)
 
@@ -308,6 +372,7 @@ class ReduceTestCase(TestCase):
             c = x.sum(dim=1)
             d = x.sum(dim=1)
             return a + b + c + d
+
         t = torch.randn(2, 2)
         check(f, t, 2)
 
@@ -318,6 +383,7 @@ class ReduceTestCase(TestCase):
             c = a + a
             d = b + b
             return c + d
+
         t = torch.randn(2, 2)
         check(f, t, 2)
 
@@ -328,6 +394,7 @@ class ReduceTestCase(TestCase):
             c = a + a
             d = b + b
             return c + d
+
         t = torch.randn(1)
         check(f, t, 3)
 
@@ -338,6 +405,7 @@ class ReduceTestCase(TestCase):
             c = x.sum(dim=1, keepdim=False)
             d = x.sum(dim=1)
             return a + b + c + d
+
         t = torch.randn(2, 2)
         check(f, t, 3)
 
@@ -348,6 +416,7 @@ class ReduceTestCase(TestCase):
             c = x.sum(dim=1, keepdim=True)
             d = x.sum(dim=1)
             return a + b + c + d
+
         t = torch.randn(2, 2)
         check(f, t, 2)
 
@@ -358,6 +427,7 @@ class ReduceTestCase(TestCase):
             c = x.sum()
             d = x.sum()
             return a + b + c + d
+
         t = torch.randn(2, 2)
         check(f, t, 3)
 
@@ -366,6 +436,7 @@ class ReduceTestCase(TestCase):
             a = torch.cat((x, x))
             b = torch.cat((x, x))
             return a + b
+
         t = torch.randn(2, 2)
         check(f, t, 1)
 
@@ -374,11 +445,51 @@ class ReduceTestCase(TestCase):
             a = torch.ones_like(x)
             b = torch.ones_like(x)
             return a + b
+
         t = torch.randn(2, 2)
         check(f, t, 1)
 
+    def test_nan_full_deduplication(self):
+        def f(x):
+            a = torch.full_like(x, float("nan"))
+            b = torch.full_like(x, float("nan"))
+            return a + b
+
+        t = torch.randn(2, 2)
+        check(f, t, 1, check_val=False)
+
+    def test_nan_dedup_non_factory_op(self):
+        def f(x):
+            a = x.clamp(min=float("nan"))
+            b = x.clamp(min=float("nan"))
+            return a + b
+
+        t = torch.randn(2, 2)
+        check(f, t, 1, check_val=False)
+
+    def test_nan_dedup_constant_pad(self):
+        def f(x):
+            a = torch.nn.functional.pad(x, (1, 1, 1, 1), value=float("nan"))
+            b = torch.nn.functional.pad(x, (1, 1, 1, 1), value=float("nan"))
+            return a + b
+
+        t = torch.randn(2, 2)
+        check(f, t, 1, check_val=False)
+
+    def test_complex_nan_full_deduplication(self):
+        def f(x):
+            y = x.to(torch.cfloat)
+            a = torch.full_like(y, complex(float("nan"), 0.0))
+            b = torch.full_like(y, complex(float("nan"), 0.0))
+            return a + b
+
+        t = torch.randn(2, 2)
+        check(f, t, 1, check_val=False)
+
 
 class RandomOpTestCase(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_random(self):
         def f(x):
             vals = [x]
@@ -396,6 +507,13 @@ class RandomOpTestCase(TestCase):
         for _ in range(30):
             check(fx_g, t, -1, graph_input=True)
 
+
+instantiate_device_type_tests(
+    TestMemoryEfficientOpAuthoringDevice,
+    globals(),
+    only_for=("cuda", "xpu"),
+    allow_xpu=True,
+)
 
 
 if __name__ == "__main__":

@@ -6,14 +6,17 @@
 
 // Normal signal handler implementation.
 #include <dirent.h>
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 
 #ifdef C10_ANDROID
 #ifndef SYS_gettid
@@ -33,6 +36,7 @@ std::atomic<int> sighupCount(0);
 std::atomic<int> hookedUpCount(0);
 
 void handleSignal(int signal) {
+  // NOLINTNEXTLINE(bugprone-switch-missing-default-case)
   switch (signal) {
     // TODO: what if the previous handler uses sa_sigaction?
     case SIGHUP:
@@ -54,7 +58,7 @@ void hookupHandler() {
   if (hookedUpCount++) {
     return;
   }
-  struct sigaction sa {};
+  struct sigaction sa{};
   // Setup the handler
   sa.sa_handler = &handleSignal;
   // Restart the system call, if at all possible
@@ -75,7 +79,7 @@ void unhookHandler() {
   if (--hookedUpCount > 0) {
     return;
   }
-  struct sigaction sa {};
+  struct sigaction sa{};
   // Setup the sighub handler
   sa.sa_handler = SIG_DFL;
   // Restart the system call, if at all possible
@@ -96,6 +100,13 @@ void unhookHandler() {
 namespace c10 {
 
 #if defined(C10_SUPPORTS_FATAL_SIGNAL_HANDLERS)
+#if defined(SYS_pidfd_send_signal) && defined(SYS_pidfd_open)
+constexpr long pidfd_send_signal = SYS_pidfd_send_signal;
+constexpr long pidfd_open = SYS_pidfd_open;
+#else
+constexpr long pidfd_send_signal = -1;
+constexpr long pidfd_open = -1;
+#endif
 
 FatalSignalHandler& FatalSignalHandler::getInstance() {
   // Leaky singleton to avoid module destructor race.
@@ -103,14 +114,11 @@ FatalSignalHandler& FatalSignalHandler::getInstance() {
   return *handler;
 }
 
-FatalSignalHandler::~FatalSignalHandler() = default;
-
 FatalSignalHandler::FatalSignalHandler()
     : fatalSignalHandlersInstalled(false),
       fatalSignalReceived(false),
       fatalSignalName("<UNKNOWN>"),
-      writingCond(PTHREAD_COND_INITIALIZER),
-      writingMutex(PTHREAD_MUTEX_INITIALIZER) {}
+      signalReceived(false) {}
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 FatalSignalHandler::signal_handler FatalSignalHandler::kSignalHandlers[] = {
@@ -157,8 +165,10 @@ void FatalSignalHandler::callPreviousSignalHandler(
 
 // needsLock signals whether we need to lock our writing mutex.
 void FatalSignalHandler::stacktraceSignalHandler(bool needsLock) {
+  std::unique_lock<std::mutex> ul(writingMutex, std::defer_lock);
   if (needsLock) {
-    pthread_mutex_lock(&writingMutex);
+    ul.lock();
+    signalReceived = true;
   }
   pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
   std::string backtrace = fmt::format(
@@ -168,21 +178,24 @@ void FatalSignalHandler::stacktraceSignalHandler(bool needsLock) {
       ::getpid(),
       tid,
       c10::get_backtrace());
-  std::cerr << backtrace << std::endl;
+  std::cerr << backtrace << '\n';
   if (needsLock) {
-    pthread_mutex_unlock(&writingMutex);
-    pthread_cond_signal(&writingCond);
+    ul.unlock();
+    writingCond.notify_all();
   }
 }
 
 void FatalSignalHandler::fatalSignalHandlerPostProcess() {}
 
-void FatalSignalHandler::fatalSignalHandlerStatic(int signum) {
-  getInstance().fatalSignalHandler(signum);
+void FatalSignalHandler::fatalSignalHandlerStatic(
+    int signum,
+    siginfo_t* info,
+    void* ctx) {
+  getInstance().fatalSignalHandler(signum, info);
 }
 
 // Our fatal signal entry point
-void FatalSignalHandler::fatalSignalHandler(int signum) {
+void FatalSignalHandler::fatalSignalHandler(int signum, siginfo_t* info) {
   // Check if this is a proper signal that we declared above.
   const char* name = getSignalName(signum);
   if (!name) {
@@ -204,29 +217,53 @@ void FatalSignalHandler::fatalSignalHandler(int signum) {
     pid_t pid = getpid();
     pid_t currentTid = static_cast<pid_t>(syscall(SYS_gettid));
     struct dirent* entry = nullptr;
-    pthread_mutex_lock(&writingMutex);
+    std::unique_lock<std::mutex> ul(writingMutex);
     while ((entry = readdir(procDir)) != nullptr) {
       if (entry->d_name[0] == '.') {
         continue;
       }
       pid_t tid = atoi(entry->d_name);
       // If we've found the current thread then we'll jump into the SIGUSR2
-      // handler before calling pthread_cond_wait thus deadlocking, so branch
-      // our directly to the backtrace handler instead of signaling it.
+      // handler instead of signaling to avoid deadlocking.
       if (tid != currentTid) {
+        signalReceived = false;
         syscall(SYS_tgkill, pid, tid, SIGUSR2);
-        pthread_cond_wait(&writingCond, &writingMutex);
+        using namespace std::chrono_literals;
+        // we use wait_until instead of wait because on ROCm there was
+        // a single thread that wouldn't receive the SIGUSR2
+        if (std::cv_status::timeout == writingCond.wait_for(ul, 2s)) {
+          if (!signalReceived) {
+            std::cerr << "signal lost waiting for stacktrace " << pid << ':'
+                      << tid << '\n';
+            break;
+          }
+        }
       } else {
         stacktraceSignalHandler(false);
       }
     }
-    pthread_mutex_unlock(&writingMutex);
   } else {
     perror("Failed to open /proc/self/task");
   }
   fatalSignalHandlerPostProcess();
   sigaction(signum, getPreviousSigaction(signum), nullptr);
-  raise(signum);
+
+  // Re-raise the signal exactly as it was received.
+  // raise() actually calls tgkill(), which will replace the body
+  // of certain signals, like SEGV, with the uid and pid of the calling process.
+  // Which is not what we want.
+  const auto pidfd = syscall(pidfd_open, getpid(), 0);
+  if (pidfd == -1 || syscall(pidfd_send_signal, pidfd, signum, info) == -1) {
+    // If we failed to send the signal, we re-raise. We could return and
+    // let the faulting instruction be re-executed, but it can be unsafe to
+    // do so. For example if the memory region that caused a SIGSEGV changed
+    // we could potentially not refault. To avoid that, we re-raise
+    // even if we delete some information from the coredump.
+    // The primary reason we'll fail here is pidfd_send_signal was added in
+    // Linux 5.1, and if we're running on a version before that our systemcalls
+    // will fail.
+    raise(signum);
+  }
 }
 
 // Our SIGUSR2 entry point
@@ -261,12 +298,12 @@ void FatalSignalHandler::installFatalSignalHandlers() {
     return;
   }
   fatalSignalHandlersInstalled = true;
-  struct sigaction sa {};
+  struct sigaction sa{};
   sigemptyset(&sa.sa_mask);
   // Since we'll be in an exiting situation it's possible there's memory
   // corruption, so make our own stack just in case.
   sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-  sa.sa_handler = FatalSignalHandler::fatalSignalHandlerStatic;
+  sa.sa_sigaction = FatalSignalHandler::fatalSignalHandlerStatic;
   for (auto* handler = kSignalHandlers; handler->name != nullptr; handler++) {
     if (sigaction(handler->signum, &sa, &handler->previous)) {
       std::string str("Failed to add ");

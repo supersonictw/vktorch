@@ -10,13 +10,17 @@ import abc
 import unittest.mock as mock
 
 from torch.distributed.elastic.metrics.api import (
+    _get_metric_name,
     MetricData,
     MetricHandler,
     MetricStream,
-    _get_metric_name,
     prof,
 )
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 def foo_1():
@@ -24,7 +28,7 @@ def foo_1():
 
 
 class TestMetricsHandler(MetricHandler):
-    def __init__(self):
+    def __init__(self) -> None:
         self.metric_data = {}
 
     def emit(self, metric_data: MetricData):
@@ -34,7 +38,7 @@ class TestMetricsHandler(MetricHandler):
 class Parent(abc.ABC):
     @abc.abstractmethod
     def func(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def base_func(self):
         self.func()
@@ -48,6 +52,8 @@ class Child(Parent):
 
 
 class MetricsApiTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def foo_2(self):
         pass
 
@@ -57,7 +63,7 @@ class MetricsApiTest(TestCase):
 
     @prof
     def throw(self):
-        raise RuntimeError()
+        raise RuntimeError
 
     @prof(group="torchelastic")
     def bar2(self):

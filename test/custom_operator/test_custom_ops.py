@@ -1,20 +1,31 @@
-# Owner(s): ["module: unknown"]
+# Owner(s): ["module: cpp-extensions"]
 
-import os.path
 import sys
 import tempfile
+import unittest
+
+from model import get_custom_op_library_path, Model
 
 import torch
+import torch._library.utils as utils
 from torch import ops
+from torch.testing._internal.common_utils import (
+    expectedIfCppFakeTensor,
+    HardwareClassification,
+    IS_WINDOWS,
+    run_tests,
+    TestCase,
+)
 
-from model import Model, get_custom_op_library_path
-from torch.testing._internal.common_utils import TestCase, run_tests, IS_WINDOWS
-import unittest
 
 torch.ops.import_module("pointwise")
 
+
 class TestCustomOperators(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
+        super().setUp()
         self.library_path = get_custom_op_library_path()
         ops.load_library(self.library_path)
 
@@ -22,19 +33,20 @@ class TestCustomOperators(TestCase):
         self.assertIn(self.library_path, ops.loaded_libraries)
 
     def test_op_with_no_abstract_impl_pystub(self):
-        x = torch.randn(3, device='meta')
-        with self.assertRaisesRegex(RuntimeError, "pointwise"):
+        x = torch.randn(3, device="meta")
+        if utils.requires_set_python_module():
+            with self.assertRaisesRegex(RuntimeError, "pointwise"):
+                torch.ops.custom.tan(x)
+        else:
+            # Smoketest
             torch.ops.custom.tan(x)
 
     def test_op_with_incorrect_abstract_impl_pystub(self):
-        x = torch.randn(3, device='meta')
+        x = torch.randn(3, device="meta")
         with self.assertRaisesRegex(RuntimeError, "pointwise"):
             torch.ops.custom.cos(x)
 
     @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on windows")
-    @unittest.skipIf(
-        sys.version_info >= (3, 12), "torch.compile is not supported on python 3.12+"
-    )
     def test_dynamo_pystub_suggestion(self):
         x = torch.randn(3)
 
@@ -42,32 +54,43 @@ class TestCustomOperators(TestCase):
         def f(x):
             return torch.ops.custom.asin(x)
 
-        with self.assertRaisesRegex(RuntimeError, r'unsupported operator: .* \(you may need to `import nonexistent`'):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"(?s)Operator does not support running with fake tensors.*you may need to `import nonexistent`",
+        ):
             f(x)
 
     def test_abstract_impl_pystub_faketensor(self):
         from functorch import make_fx
-        x = torch.randn(3, device='cpu')
+
+        x = torch.randn(3)
         self.assertNotIn("my_custom_ops", sys.modules.keys())
 
-        with self.assertRaises(torch._subclasses.fake_tensor.UnsupportedOperatorException):
+        unsupported_error = expectedIfCppFakeTensor(
+            RuntimeError,
+            torch._subclasses.fake_tensor.UnsupportedOperatorException,
+        )
+        with self.assertRaises(unsupported_error):
             gm = make_fx(torch.ops.custom.nonzero.default, tracing_mode="symbolic")(x)
 
         torch.ops.import_module("my_custom_ops")
         gm = make_fx(torch.ops.custom.nonzero.default, tracing_mode="symbolic")(x)
-        self.assertExpectedInline("""\
+        self.assertExpectedInline(
+            """\
 def forward(self, arg0_1):
     nonzero = torch.ops.custom.nonzero.default(arg0_1);  arg0_1 = None
     return nonzero
-""".strip(), gm.code.strip())
+""".strip(),
+            gm.code.strip(),
+        )
 
     def test_abstract_impl_pystub_meta(self):
         x = torch.randn(3, device="meta")
         self.assertNotIn("my_custom_ops2", sys.modules.keys())
-        with self.assertRaisesRegex(NotImplementedError, r"import the 'my_custom_ops2'"):
-            y = torch.ops.custom.sin.default(x)
+        with self.assertRaisesRegex(NotImplementedError, r"'my_custom_ops2'"):
+            torch.ops.custom.sin.default(x)
         torch.ops.import_module("my_custom_ops2")
-        y = torch.ops.custom.sin.default(x)
+        torch.ops.custom.sin.default(x)
 
     def test_calling_custom_op_string(self):
         output = ops.custom.op2("abc", "def")
@@ -130,16 +153,13 @@ def forward(self, arg0_1):
         # Ideally we would like to not have to manually delete the file, but NamedTemporaryFile
         # opens the file, and it cannot be opened multiple times in Windows. To support Windows,
         # close the file after creation and try to remove it manually.
-        file = tempfile.NamedTemporaryFile(delete=False)
-        try:
+        with tempfile.NamedTemporaryFile() as file:
             file.close()
             model.save(file.name)
             loaded = torch.jit.load(file.name)
-        finally:
-            os.unlink(file.name)
 
-        output = loaded.forward(torch.ones(5))
-        self.assertTrue(output.allclose(torch.ones(5) + 1))
+            output = loaded.forward(torch.ones(5))
+            self.assertTrue(output.allclose(torch.ones(5) + 1))
 
 
 if __name__ == "__main__":

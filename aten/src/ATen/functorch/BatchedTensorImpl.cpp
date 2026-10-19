@@ -10,8 +10,7 @@
 
 #include <c10/util/irange.h>
 
-namespace at {
-namespace functorch {
+namespace at::functorch {
 
 BatchedTensorImpl::BatchedTensorImpl(DispatchKeySet key_set, Tensor value, int64_t bdim, int64_t level)
   : TensorImpl(
@@ -71,7 +70,7 @@ void BatchedTensorImpl::refreshTensorMetadata() {
 int64_t BatchedTensorImpl::actualDim(int64_t dim, bool wrap_dim) const {
   if (wrap_dim) {
     const auto ndim = sizes_and_strides_.size();
-    dim = maybe_wrap_dim(dim, ndim);
+    dim = maybe_wrap_dim(dim, static_cast<int64_t>(ndim));
   }
   if (bdim_ <= dim) {
     return dim + 1;
@@ -114,7 +113,7 @@ SymIntArrayRef BatchedTensorImpl::sym_sizes_custom() const {
   return sym_sizes_default();
 }
 
-// The following are publically exposed as methods of Tensor
+// The following are publicly exposed as methods of Tensor
 
 IntArrayRef BatchedTensorImpl::strides_custom() const {
   return strides_default();
@@ -127,7 +126,7 @@ SymIntArrayRef BatchedTensorImpl::sym_strides_custom() const {
 
 // TODO: implement proper contiguity on batched tensor, then put
 // sizes_strides_policy back to Default
-bool BatchedTensorImpl::is_contiguous_custom(at::MemoryFormat memory_format) const {
+c10::SymBool BatchedTensorImpl::sym_is_contiguous_custom(at::MemoryFormat memory_format) const {
   TORCH_CHECK(memory_format == MemoryFormat::Contiguous,
       "NYI: querying is_contiguous inside of vmap for memory_format ",
       "other than torch.contiguous_format");
@@ -157,33 +156,31 @@ c10::intrusive_ptr<TensorImpl> BatchedTensorImpl::shallow_copy_and_detach(
     const c10::VariableVersion& version_counter,
     bool allow_tensor_metadata_change) const {
   TORCH_CHECK(false, "accessing `data` under vmap transform is not allowed");
-  return nullptr;
 }
 
 c10::intrusive_ptr<TensorImpl> BatchedTensorImpl::shallow_copy_and_detach(
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
     c10::VariableVersion&& version_counter,
     bool allow_tensor_metadata_change) const {
   TORCH_CHECK(false, "accessing `data` under vmap transform is not allowed");
-  return nullptr;
 }
 
 void BatchedTensorImpl::shallow_copy_from(const c10::intrusive_ptr<TensorImpl>& impl) {
   TORCH_CHECK(false, "mutating directly with `.data` under vmap transform is not allowed.");
 }
 
-Tensor makeBatched(const Tensor& tensor, int64_t bdim, int64_t level) {
+Tensor makeBatched(Tensor tensor, int64_t bdim, int64_t level) {
   DispatchKeySet key_set = getKeysToPropagateToWrapper(tensor);
   auto* batched = maybeGetBatchedImpl(tensor);
   if (batched) {
     auto batched_level = batched->level();
     TORCH_INTERNAL_ASSERT(level > batched_level, " batched_level: ", batched_level, " level: ", level);
   }
-  return at::detail::make_tensor<BatchedTensorImpl>(key_set, tensor, bdim, level);
+  return at::detail::make_tensor<BatchedTensorImpl>(key_set, std::move(tensor), bdim, level);
 }
 
-Tensor addBatchDim(const Tensor& tensor, int64_t dim, int64_t level) {
-  return makeBatched(tensor, dim, level);
+Tensor addBatchDim(Tensor tensor, int64_t dim, int64_t level) {
+  return makeBatched(std::move(tensor), dim, level);
 }
 
-}
-} // namespace at
+} // namespace at::functorch

@@ -4,9 +4,7 @@
 
 #include <utility>
 
-namespace torch {
-namespace nn {
-namespace functional {
+namespace torch::nn::functional {
 
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
 namespace detail {
@@ -27,7 +25,7 @@ inline Tensor dropout(Tensor input, double p, bool training, bool inplace) {
 #endif /* DOXYGEN_SHOULD_SKIP_THIS */
 
 /// See
-/// https://pytorch.org/docs/master/nn.functional.html#torch.nn.functional.dropout
+/// https://pytorch.org/docs/main/nn.functional.html#torch.nn.functional.dropout
 /// about the exact behavior of this functional.
 ///
 /// See the documentation for `torch::nn::functional::DropoutFuncOptions` class
@@ -54,7 +52,7 @@ inline Tensor _dropoutNd_helper(
     double p,
     bool training,
     bool inplace,
-    const char* fn_name) {
+    const char* /*fn_name*/) {
   TORCH_CHECK(
       p >= 0. && p <= 1.,
       "dropout probability has to be between 0 and 1, but got ",
@@ -96,7 +94,7 @@ inline Tensor dropout2d(Tensor input, double p, bool training, bool inplace) {
 #endif /* DOXYGEN_SHOULD_SKIP_THIS */
 
 /// See
-/// https://pytorch.org/docs/master/nn.functional.html#torch.nn.functional.dropout2d
+/// https://pytorch.org/docs/main/nn.functional.html#torch.nn.functional.dropout2d
 /// about the exact behavior of this functional.
 ///
 /// See the documentation for `torch::nn::functional::Dropout2dFuncOptions`
@@ -128,7 +126,7 @@ inline Tensor dropout3d(Tensor input, double p, bool training, bool inplace) {
 #endif /* DOXYGEN_SHOULD_SKIP_THIS */
 
 /// See
-/// https://pytorch.org/docs/master/nn.functional.html#torch.nn.functional.dropout3d
+/// https://pytorch.org/docs/main/nn.functional.html#torch.nn.functional.dropout3d
 /// about the exact behavior of this functional.
 ///
 /// See the documentation for `torch::nn::functional::Dropout3dFuncOptions`
@@ -168,7 +166,7 @@ inline Tensor alpha_dropout(
 #endif /* DOXYGEN_SHOULD_SKIP_THIS */
 
 /// See
-/// https://pytorch.org/docs/master/nn.functional.html#torch.nn.functional.alpha_dropout
+/// https://pytorch.org/docs/main/nn.functional.html#torch.nn.functional.alpha_dropout
 /// about the exact behavior of this functional.
 ///
 /// See the documentation for `torch::nn::functional::AlphaDropoutFuncOptions`
@@ -209,7 +207,7 @@ inline Tensor feature_alpha_dropout(
 #endif /* DOXYGEN_SHOULD_SKIP_THIS */
 
 /// See
-/// https://pytorch.org/docs/master/nn.functional.html#torch.nn.functional.feature_alpha_dropout
+/// https://pytorch.org/docs/main/nn.functional.html#torch.nn.functional.feature_alpha_dropout
 /// about the exact behavior of this functional.
 ///
 /// See the documentation for
@@ -229,6 +227,4 @@ inline Tensor feature_alpha_dropout(
       std::move(input), options.p(), options.training(), options.inplace());
 }
 
-} // namespace functional
-} // namespace nn
-} // namespace torch
+} // namespace torch::nn::functional

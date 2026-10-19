@@ -1,12 +1,22 @@
 #pragma once
 
-#include <ATen/core/Generator.h>
-#include <ATen/cuda/PhiloxCudaState.h>
 #include <ATen/Context.h>
-#include <limits>
+#include <ATen/core/Generator.h>
+#include <ATen/core/TensorBase.h>
+#include <ATen/cuda/PhiloxCudaState.h>
+#include <c10/core/Allocator.h>
 #include <atomic>
+#include <memory>
+#include <mutex>
 
 namespace at {
+
+namespace cuda {
+struct CUDAGraph;
+}
+
+using CaptureId_t = c10::CaptureId_t;
+
 /**
  * Note [CUDA Graph-safe RNG states]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -32,7 +42,7 @@ namespace at {
  * Meanwhile, within the graph, at capture time, instead of
  * populating PhiloxCudaStates with the uint64_t offset pulled
  * directly from the global state, PhiloxCudaState uses a pointer
- * to a one-element stream-local int64_t device tensor
+ * to a one-element graph-owned int64_t device tensor
  * holding an initial offset value, and a uint64_t holding an
  * intra-graph offset. (The intra-graph offset starts from zero
  * when capture begins.)  In each consumer kernel,
@@ -46,7 +56,8 @@ namespace at {
  * The control flow above ensures graphed execution is bitwise
  * identical to eager execution as long as RNG ops are enqueued
  * from a single thread, even if RNG ops and graphs containing
- * RNG ops are enqueued and run simultaneously on multiple streams.
+ * RNG ops are enqueued and run simultaneously on multiple streams,
+ * provided overlapping replays use different graphs.
  *
  * Usage:
  * ~~~~~~
@@ -87,9 +98,54 @@ namespace at {
  *
  */
 
+/**
+ * Per-capture state for a generator.
+ * Owned by CUDAGraph and assigned lazily to a generator state during capture.
+ */
+struct CUDAGeneratorCaptureState : public c10::intrusive_ptr_target {
+  uint64_t offset_intragraph_{0};
+  at::TensorBase rng_state_seed_extragraph_;
+  at::TensorBase rng_state_offset_extragraph_;
+
+  CUDAGeneratorCaptureState() = default;
+
+  bool is_initialized() const { return rng_state_seed_extragraph_.defined(); }
+  void initialize(c10::DeviceIndex device);
+  void increase(uint64_t increment);
+  uint64_t finalize();
+  void setup_for_replay(uint64_t seed, uint64_t philox_offset);
+};
+
+/**
+ * Shared seed and eager offset for a generator and its graphsafe aliases.
+ * Capture-specific state belongs to CUDAGraph.
+ */
+struct CUDAGeneratorState : public c10::intrusive_ptr_target {
+  uint64_t seed_;
+  uint64_t philox_offset_per_thread_;
+
+  CUDAGeneratorState(
+      uint64_t seed = default_rng_seed_val,
+      uint64_t philox_offset_per_thread = 0)
+      : seed_(seed),
+        philox_offset_per_thread_(philox_offset_per_thread) {}
+
+  void increase(uint64_t increment);
+
+  CUDAGeneratorCaptureState* get_capture_state(CaptureId_t capture_id);
+  void replay_prologue(
+      CUDAGeneratorCaptureState& capture_state,
+      uint64_t wholegraph_increment);
+
+  c10::intrusive_ptr<CUDAGeneratorState> clone();
+};
+
 struct TORCH_CUDA_CPP_API CUDAGeneratorImpl : public c10::GeneratorImpl {
   // Constructors
   CUDAGeneratorImpl(DeviceIndex device_index = -1);
+  CUDAGeneratorImpl(
+      DeviceIndex device_index,
+      c10::intrusive_ptr<CUDAGeneratorState> state_);
   ~CUDAGeneratorImpl() override = default;
 
   // CUDAGeneratorImpl methods
@@ -101,10 +157,20 @@ struct TORCH_CUDA_CPP_API CUDAGeneratorImpl : public c10::GeneratorImpl {
   uint64_t seed() override;
   void set_state(const c10::TensorImpl& new_state) override;
   c10::intrusive_ptr<c10::TensorImpl> get_state() const override;
+  void graphsafe_set_state(
+      const c10::intrusive_ptr<GeneratorImpl>& state) override;
+  c10::intrusive_ptr<c10::GeneratorImpl> graphsafe_get_state() const override;
+  void philox_state(
+      uint64_t increment,
+      at::Tensor& seed,
+      at::Tensor& offset,
+      at::Tensor& intragraph_offset) override;
+
   void set_philox_offset_per_thread(uint64_t offset);
   uint64_t philox_offset_per_thread() const;
-  void capture_prologue(int64_t* seed_extragraph, int64_t* offset_extragraph);
-  uint64_t capture_epilogue();
+
+  // Generates a PhiloxCudaState with a specified increment, and increment
+  // current state
   PhiloxCudaState philox_cuda_state(uint64_t increment);
 
   bool reset_rnn_state() {
@@ -117,14 +183,10 @@ struct TORCH_CUDA_CPP_API CUDAGeneratorImpl : public c10::GeneratorImpl {
 
   static c10::DeviceType device_type();
 
-private:
+ private:
   CUDAGeneratorImpl* clone_impl() const override;
-  uint64_t seed_ = default_rng_seed_val;
-  uint64_t philox_offset_per_thread_ = 0;
-  int64_t* seed_extragraph_{};
-  int64_t* offset_extragraph_{};
-  uint32_t offset_intragraph_ = 0;
-  bool graph_expects_this_gen_ = false;
+
+  c10::intrusive_ptr<CUDAGeneratorState> state_;
   std::atomic_flag no_reset_rnn_state_;
 };
 

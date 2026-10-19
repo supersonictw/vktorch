@@ -26,22 +26,41 @@ struct C10_API SafePyObject {
   SafePyObject(SafePyObject&& other) noexcept
       : data_(std::exchange(other.data_, nullptr)),
         pyinterpreter_(other.pyinterpreter_) {}
+  // For now it's not used, so we just disallow it.
+  SafePyObject& operator=(SafePyObject&&) = delete;
 
-  // In principle this could be copyable if we add an incref to PyInterpreter
-  // but for now it's easier to just disallow it.
-  SafePyObject(SafePyObject const&) = delete;
-  SafePyObject& operator=(SafePyObject const&) = delete;
+  SafePyObject(SafePyObject const& other)
+      : data_(other.data_), pyinterpreter_(other.pyinterpreter_) {
+    if (data_ != nullptr) {
+      (*pyinterpreter_)->incref(data_);
+    }
+  }
+
+  SafePyObject& operator=(SafePyObject const& other) {
+    if (this == &other) {
+      return *this; // Handle self-assignment
+    }
+    if (other.data_ != nullptr) {
+      (*other.pyinterpreter_)->incref(other.data_);
+    }
+    if (data_ != nullptr) {
+      (*pyinterpreter_)->decref(data_);
+    }
+    data_ = other.data_;
+    pyinterpreter_ = other.pyinterpreter_;
+    return *this;
+  }
 
   ~SafePyObject() {
     if (data_ != nullptr) {
-      (*pyinterpreter_)->decref(data_, /*has_pyobj_slot*/ false);
+      (*pyinterpreter_)->decref(data_);
     }
   }
 
   c10::impl::PyInterpreter& pyinterpreter() const {
     return *pyinterpreter_;
   }
-  PyObject* ptr(const c10::impl::PyInterpreter*) const;
+  PyObject* ptr(const c10::impl::PyInterpreter* /*interpreter*/) const;
 
   // stop tracking the current object, and return it
   PyObject* release() {
@@ -55,6 +74,24 @@ struct C10_API SafePyObject {
   c10::impl::PyInterpreter* pyinterpreter_;
 };
 
+// A newtype wrapper around SafePyObject for type safety when a python object
+// represents a specific type. Note that `T` is only used as a tag and isn't
+// actually used for any true purpose.
+template <typename T>
+struct SafePyObjectT : private SafePyObject {
+  SafePyObjectT(PyObject* data, c10::impl::PyInterpreter* pyinterpreter)
+      : SafePyObject(data, pyinterpreter) {}
+  ~SafePyObjectT() = default;
+  SafePyObjectT(SafePyObjectT&& other) noexcept : SafePyObject(other) {}
+  SafePyObjectT(SafePyObjectT const&) = delete;
+  SafePyObjectT& operator=(SafePyObjectT const&) = delete;
+  SafePyObjectT& operator=(SafePyObjectT&&) = delete;
+
+  using SafePyObject::ptr;
+  using SafePyObject::pyinterpreter;
+  using SafePyObject::release;
+};
+
 // Like SafePyObject, but non-owning.  Good for references to global PyObjects
 // that will be leaked on interpreter exit.  You get a copy constructor/assign
 // this way.
@@ -66,7 +103,7 @@ struct C10_API SafePyHandle {
   c10::impl::PyInterpreter& pyinterpreter() const {
     return *pyinterpreter_;
   }
-  PyObject* ptr(const c10::impl::PyInterpreter*) const;
+  PyObject* ptr(const c10::impl::PyInterpreter* /*interpreter*/) const;
   void reset() {
     data_ = nullptr;
     pyinterpreter_ = nullptr;

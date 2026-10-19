@@ -17,15 +17,15 @@
 #define VK_FORMAT_FLOAT4 VK_FORMAT_R32G32B32A32_SFLOAT
 #endif /* USE_VULKAN_FP16_INFERENCE */
 
-#define VK_FORALL_SCALAR_TYPES(_)                        \
-  _(uint8_t, VK_FORMAT_R8G8B8A8_UINT, Byte)              \
-  _(int8_t, VK_FORMAT_R8G8B8A8_SINT, Char)               \
-  _(int32_t, VK_FORMAT_R32G32B32A32_SINT, Int)           \
-  _(bool, VK_FORMAT_R8G8B8A8_SINT, Bool)                 \
-  _(unsigned short, VK_FORMAT_R16G16B16A16_SFLOAT, Half) \
-  _(float, VK_FORMAT_FLOAT4, Float)                      \
-  _(int8_t, VK_FORMAT_R8G8B8A8_SINT, QInt8)              \
-  _(uint8_t, VK_FORMAT_R8G8B8A8_UINT, QUInt8)            \
+#define VK_FORALL_SCALAR_TYPES(_)               \
+  _(uint8_t, VK_FORMAT_R8G8B8A8_UINT, Byte)     \
+  _(int8_t, VK_FORMAT_R8G8B8A8_SINT, Char)      \
+  _(int32_t, VK_FORMAT_R32G32B32A32_SINT, Int)  \
+  _(bool, VK_FORMAT_R8G8B8A8_SINT, Bool)        \
+  _(float, VK_FORMAT_R16G16B16A16_SFLOAT, Half) \
+  _(float, VK_FORMAT_FLOAT4, Float)             \
+  _(int8_t, VK_FORMAT_R8G8B8A8_SINT, QInt8)     \
+  _(uint8_t, VK_FORMAT_R8G8B8A8_UINT, QUInt8)   \
   _(int32_t, VK_FORMAT_R32G32B32A32_SINT, QInt32)
 
 namespace at {
@@ -71,7 +71,7 @@ inline VkFormat to_vkformat(const ScalarType t) {
 
 /*
  * Given a `VkFormat`, return the `ScalarType` that best represents the data
- * type of invidivual elements in an image texture of the `VkFormat`. Note that
+ * type of individual elements in an image texture of the `VkFormat`. Note that
  * this mapping is different from the `to_vkformat()` function, since different
  * `ScalarType`s may use the same `VkFormat`.
  */

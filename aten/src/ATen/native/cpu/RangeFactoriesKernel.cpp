@@ -6,6 +6,7 @@
 #include <ATen/native/DispatchStub.h>
 
 #include <ATen/AccumulateType.h>
+#include <ATen/OpMathType.h>
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/Parallel.h>
@@ -18,7 +19,7 @@ namespace {
 
 using namespace vec;
 
-static void arange_kernel(TensorIterator& iter, const Scalar& scalar_start, const Scalar& scalar_steps, const Scalar& scalar_step) {
+void arange_kernel(TensorIterator& iter, const Scalar& scalar_start, const Scalar& scalar_steps, const Scalar& scalar_step) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "arange_cpu", [&]() {
     using accscalar_t = at::acc_type<scalar_t, false>;
     auto start = scalar_start.to<accscalar_t>();
@@ -42,10 +43,14 @@ static void arange_kernel(TensorIterator& iter, const Scalar& scalar_start, cons
   });
 }
 
-static void linspace_kernel(TensorIterator& iter, const Scalar& scalar_start, const Scalar& scalar_end, int64_t steps) {
+void linspace_kernel(TensorIterator& iter, const Scalar& scalar_start, const Scalar& scalar_end, int64_t steps) {
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16, iter.dtype(), "linspace_cpu", [&]() {
-    // step should be of double type for all integral types
-    using step_t = std::conditional_t<std::is_integral<scalar_t>::value, double, scalar_t>;
+    // step should be of double type for all integral types, and of the opmath
+    // type for reduced-precision floats: rounding step to half or bfloat16 and
+    // then multiplying by the index compounds that rounding across the range.
+    // arange_kernel above widens for the same reason.
+    using step_t = std::
+        conditional_t<std::is_integral_v<scalar_t>, double, at::opmath_type<scalar_t>>;
     const scalar_t start = scalar_start.to<scalar_t>();
     const scalar_t end = scalar_end.to<scalar_t>();
     // Cast `end` and `start` to `step_t`, since range can be larger than scalar_t for integral types
@@ -71,7 +76,7 @@ static void linspace_kernel(TensorIterator& iter, const Scalar& scalar_start, co
 
 } // anonymous namespace
 
-REGISTER_DISPATCH(arange_stub, &arange_kernel);
-REGISTER_DISPATCH(linspace_stub, &linspace_kernel);
+REGISTER_DISPATCH(arange_stub, &arange_kernel)
+REGISTER_DISPATCH(linspace_stub, &linspace_kernel)
 
 } // namespace at::native

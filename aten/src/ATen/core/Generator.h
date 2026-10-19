@@ -1,12 +1,9 @@
 #pragma once
 
-#include <mutex>
-#include <deque>
-#include <atomic>
-#include <typeinfo>
-#include <utility>
-#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
+#include <utility>
 
 #include <c10/util/Exception.h>
 #include <c10/util/intrusive_ptr.h>
@@ -62,18 +59,10 @@ struct TORCH_API Generator {
 
   explicit Generator(c10::intrusive_ptr<c10::GeneratorImpl> gen_impl)
    : impl_(std::move(gen_impl)) {
-    if (impl_.get() == nullptr) {
-      throw std::runtime_error("GeneratorImpl with nullptr is not supported");
-    }
+    TORCH_CHECK(impl_.get(), "GeneratorImpl with nullptr is not supported");
   }
 
-  bool operator==(const Generator& rhs) const {
-    return this->impl_ == rhs.impl_;
-  }
-
-  bool operator!=(const Generator& rhs) const {
-    return !((*this) == rhs);
-  }
+  bool operator==(const Generator& rhs) const = default;
 
   bool defined() const {
     return static_cast<bool>(impl_);
@@ -109,6 +98,14 @@ struct TORCH_API Generator {
   void set_state(const at::Tensor& new_state);
 
   at::Tensor get_state() const;
+
+  void graphsafe_set_state(const Generator& new_state);
+
+  Generator graphsafe_get_state() const;
+
+  // See c10::GeneratorImpl::philox_state.
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> philox_state(
+      uint64_t increment);
 
   std::mutex& mutex() {
     return impl_->mutex_;
@@ -149,7 +146,7 @@ Generator make_generator(Args&&... args) {
  * the backend generator type (CPU/CUDAGeneratorImpl etc.)
  */
 template <typename T>
-static inline T * check_generator(c10::optional<Generator> gen) {
+inline T * check_generator(std::optional<Generator> gen) {
   TORCH_CHECK(gen.has_value(), "Expected Generator but received nullopt");
   TORCH_CHECK(gen->defined(), "Generator with undefined implementation is not allowed");
   TORCH_CHECK(T::device_type() == gen->device().type(), "Expected a '", T::device_type(), "' device type for generator but found '", gen->device().type(), "'");
@@ -163,7 +160,7 @@ static inline T * check_generator(c10::optional<Generator> gen) {
  * the backend generator type (CPU/CUDAGeneratorImpl etc.)
  */
 template <typename T>
-static inline T* get_generator_or_default(const c10::optional<Generator>& gen, const Generator& default_gen) {
+inline T* get_generator_or_default(const std::optional<Generator>& gen, const Generator& default_gen) {
   return gen.has_value() && gen->defined() ? check_generator<T>(gen) : check_generator<T>(default_gen);
 }
 
@@ -176,7 +173,7 @@ namespace detail {
  * - The new state tensor must be a torch.ByteTensor
  * - Data of the new state tensor must be contiguous
  */
-static inline void check_rng_state(const c10::TensorImpl& new_state) {
+inline void check_rng_state(const c10::TensorImpl& new_state) {
   TORCH_CHECK_TYPE(
     new_state.layout() == kStrided && new_state.device().type() == kCPU && new_state.dtype() == kByte,
     "RNG state must be a torch.ByteTensor"

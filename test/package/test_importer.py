@@ -1,4 +1,4 @@
-# Owner(s): ["oncall: package/deploy"]
+# Owner(s): ["module: package/deploy"]
 
 from io import BytesIO
 
@@ -11,6 +11,7 @@ from torch.package import (
     sys_importer,
 )
 from torch.testing._internal.common_utils import run_tests
+
 
 try:
     from .common import PackageTestCase
@@ -98,7 +99,7 @@ class TestImporter(PackageTestCase):
                 self._whichmodule_return = whichmodule_return
 
             def import_module(self, module_name):
-                raise NotImplementedError()
+                raise NotImplementedError
 
             def whichmodule(self, obj, name):
                 return self._whichmodule_return

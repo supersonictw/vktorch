@@ -4,6 +4,7 @@ import os
 import time
 
 import numpy as np
+
 import torch
 
 from . import tensor_engine
@@ -33,7 +34,7 @@ class Benchmark:
         for method in dir(self.engine):
             if not callable(getattr(self.engine, method)):
                 continue
-            # don't forward if this function is overriden here
+            # don't forward if this function is overridden here
             if hasattr(self, method):
                 continue
             # don't forward if it is a internal function
@@ -88,7 +89,7 @@ class Benchmark:
 
     @staticmethod
     def default_configs():
-        """return a list of defualt configs for this benchmark"""
+        """return a list of default configs for this benchmark"""
         raise ValueError("this method should be reimplemented by subclass")
 
     def is_supported(self):
@@ -211,7 +212,7 @@ class Benchmark:
                 msg += f", compute {result_dict['compute_workload']:.2f} Gops/s"
             print(msg)
         else:
-            raise Exception("Unknown output_type " + self.output_type)
+            raise Exception("Unknown output_type " + self.output_type)  # noqa: TRY002
 
 
 @contextlib.contextmanager

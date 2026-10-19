@@ -1,5 +1,6 @@
+# mypy: allow-untyped-defs
 
-from typing import cast, List
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -59,11 +60,11 @@ def sharded_embedding_bag(types, args, kwargs, pg):
                [4, 0, 4, 4, 4, 4],
                [4, 4, 4, 4, 4, 1]])
     3. If ``max_norm`` is specified, the extra row guarantees that the mask ID will
-       not affect the behavior of weigh re-norm.
+       not affect the behavior of weight re-norm.
     4. The example above only happens in one rank and each rank does a very similar thing.
        For "Mean" mode we need to divide by either column size (2D) or the interval length
        defined by the offset (excluding the row specified in ``padding_idx``).
-       We also need to mask the unexisting row to neg Inf so that negative value does not
+       We also need to mask the nonexistent row to neg Inf so that negative value does not
        gets wiped out in the "Max" mode.
 
     COLWISE SHARDING
@@ -221,7 +222,7 @@ def _validate_embedding_bag_param(args, kwargs):
         )
     if include_last_offset and offsets is None:
         raise ValueError('offsets is required for flag "include_last_offset"!')
-    if include_last_offset and cast(List[int], offsets)[-1] != input.size(0):
+    if include_last_offset and cast(list[int], offsets)[-1] != input.size(0):
         raise ValueError(
             'offsets need to have the input size in the end when the flag "include_last_offset" is on!'
         )
@@ -268,7 +269,7 @@ def _handle_col_wise_sharding(
         padding_idx: If specified, the entries at padding_idx do
             not contribute to the gradient; therefore, the embedding
             vector at padding_idx is not updated during training,
-            i.e. it remains as a fixed “pad”.
+            i.e. it remains as a fixed "pad".
             Note that the embedding vector at padding_idx is
             excluded from the reduction.
         pg: process group.
@@ -342,7 +343,7 @@ def _handle_row_wise_sharding(
         padding_idx: If specified, the entries at padding_idx do
             not contribute to the gradient; therefore, the embedding
             vector at padding_idx is not updated during training,
-            i.e. it remains as a fixed “pad”.
+            i.e. it remains as a fixed "pad".
             Note that the embedding vector at padding_idx is
             excluded from the reduction.
         rank: # of cuda process.

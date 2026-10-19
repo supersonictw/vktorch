@@ -1,7 +1,6 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <mutex>
-#include <unordered_map>
 #include <utility>
 
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
@@ -12,8 +11,7 @@ int device_count = 0;
 
 void custom_raw_deleter(void* ptr);
 
-_AllocationMetadata::_AllocationMetadata()
-    : size(0), device_idx(-1), stream{} {}
+_AllocationMetadata::_AllocationMetadata() : size(0), device_idx(-1) {}
 
 _AllocationMetadata::_AllocationMetadata(
     size_t size,
@@ -94,13 +92,11 @@ void* CUDAPluggableAllocator::malloc(
   return r;
 }
 
-c10::DataPtr CUDAPluggableAllocator::allocate(size_t size) const {
+c10::DataPtr CUDAPluggableAllocator::allocate(size_t size) {
   c10::DeviceIndex device = -1;
   C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device);
-  void* r =
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-      const_cast<CUDAPluggableAllocator*>(this)->malloc(size, device, stream);
+  void* r = this->malloc(size, device, stream);
   c10::DataPtr data_ptr = {
       r, r, raw_deleter(), c10::Device(c10::DeviceType::CUDA, device)};
   return data_ptr;
@@ -154,6 +150,13 @@ bool CUDAPluggableAllocator::initialized() {
   return initialized_;
 }
 
+double CUDAPluggableAllocator::getMemoryFraction(c10::DeviceIndex device) {
+  TORCH_CHECK(
+      false,
+      "CUDAPluggableAllocator does not yet support getMemoryFraction. "
+      "If you need it, please file an issue describing your use case.");
+}
+
 void CUDAPluggableAllocator::setMemoryFraction(
     double fraction,
     c10::DeviceIndex device) {
@@ -162,9 +165,17 @@ void CUDAPluggableAllocator::setMemoryFraction(
   }
 }
 
-void CUDAPluggableAllocator::emptyCache() {
+std::vector<c10::cuda::CUDACachingAllocator::StreamSegmentSize>
+CUDAPluggableAllocator::getExpandableSegmentSizes(c10::DeviceIndex device) {
+  TORCH_CHECK(
+      false,
+      "CUDAMallocAsyncAllocator does not yet support getExpandableSegmentSizes.");
+}
+
+void CUDAPluggableAllocator::emptyCache(
+    /*unused*/ c10::cuda::MempoolId_t mempool_id) {
   if (reset_fn_) {
-    return reset_fn_();
+    reset_fn_();
   }
 }
 
@@ -187,14 +198,14 @@ void* CUDAPluggableAllocator::getBaseAllocation(void* ptr, size_t* size) {
 
 void CUDAPluggableAllocator::recordStream(
     const c10::DataPtr& ptr,
-    streamType stream) {
+    c10::cuda::CUDAStream stream) {
   if (record_stream_fn_) {
     record_stream_fn_(ptr.get(), stream);
   }
 }
 
-c10::cuda::CUDACachingAllocator::DeviceStats CUDAPluggableAllocator::
-    getDeviceStats(c10::DeviceIndex device) {
+c10::CachingDeviceAllocator::DeviceStats CUDAPluggableAllocator::getDeviceStats(
+    c10::DeviceIndex device) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support getDeviceStats. "
@@ -215,11 +226,20 @@ void CUDAPluggableAllocator::resetPeakStats(c10::DeviceIndex device) {
       "If you need it, please file an issue describing your use case.");
 }
 
-c10::cuda::CUDACachingAllocator::SnapshotInfo CUDAPluggableAllocator::
-    snapshot() {
+c10::cuda::CUDACachingAllocator::SnapshotInfo CUDAPluggableAllocator::snapshot(
+    c10::cuda::MempoolId_t mempool_id,
+    bool include_traces) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support snapshot. "
+      "If you need it, please file an issue describing your use case.");
+}
+
+c10::cuda::CUDACachingAllocator::ShareableHandle CUDAPluggableAllocator::
+    shareIpcHandle(void* ptr) {
+  TORCH_CHECK(
+      false,
+      "CUDAPluggableAllocator does not yet support shareIPcHandle. "
       "If you need it, please file an issue describing your use case.");
 }
 
@@ -260,7 +280,9 @@ void CUDAPluggableAllocator::recordHistory(
     bool enabled,
     c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
     size_t alloc_trace_max_entries,
-    c10::cuda::CUDACachingAllocator::RecordContext when) {
+    c10::cuda::CUDACachingAllocator::RecordContext when,
+    bool clearHistory,
+    const std::vector<std::string>& skip_actions) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support recordHistory. "
@@ -272,6 +294,14 @@ void CUDAPluggableAllocator::attachOutOfMemoryObserver(
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support attachOutOfMemoryObserver. "
+      "If you need it, please file an issue describing your use case.");
+}
+
+void CUDAPluggableAllocator::attachOomRejectionObserver(
+    c10::cuda::CUDACachingAllocator::OomRejectionObserver observer) {
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false,
+      "CUDAPluggableAllocator does not yet support attachOomRejectionObserver. "
       "If you need it, please file an issue describing your use case.");
 }
 

@@ -35,7 +35,7 @@ inline int64_t maybe_wrap_dim(
     // if necessary
     return dim;
   }
-  return maybe_wrap_dim(dim, tensor_sizes[0].size());
+  return maybe_wrap_dim(dim, static_cast<int64_t>(tensor_sizes[0].size()));
 }
 
 // Given an array of dimensions `dims` of length `ndims`, this function "Wraps"
@@ -104,37 +104,40 @@ inline void maybe_wrap_dims(
 // dimension behavior and dimension size checking). We maintain this behavior
 // for backwards compatibility, but only for this specific size (i.e. other
 // empty sizes are not skipped).
-template <typename T>
-inline int64_t _legacy_cat_wrap_dim(
+inline int64_t legacy_cat_wrap_dim(
     int64_t dim,
-    const std::vector<std::vector<T>>& tensor_sizes) {
+    const std::vector<std::vector<int64_t>>& tensor_sizes) {
   for (auto& sizes : tensor_sizes) {
     if (sizes.size() == 1 && sizes[0] == 0) {
       continue;
     }
-    return maybe_wrap_dim(dim, sizes.size());
+    return maybe_wrap_dim(dim, static_cast<int64_t>(sizes.size()));
+  }
+  return dim;
+}
+
+inline int64_t legacy_cat_wrap_dim_symint(
+    int64_t dim,
+    const std::vector<std::vector<c10::SymInt>>& tensor_sizes) {
+  for (auto& sizes : tensor_sizes) {
+    if (sizes.size() == 1) {
+      if (TORCH_GUARD_OR_FALSE(sizes[0].sym_eq(0))) {
+        continue;
+      }
+    }
+    return maybe_wrap_dim(dim, static_cast<int64_t>(sizes.size()));
   }
   return dim;
 }
 
 inline int64_t legacy_cat_wrap_dim(
     int64_t dim,
-    const std::vector<std::vector<int64_t>>& tensor_sizes) {
-  return _legacy_cat_wrap_dim<int64_t>(dim, tensor_sizes);
-}
-
-inline int64_t legacy_cat_wrap_dim_symint(
-    int64_t dim,
-    const std::vector<std::vector<c10::SymInt>>& tensor_sizes) {
-  return _legacy_cat_wrap_dim<c10::SymInt>(dim, tensor_sizes);
-}
-
-inline int64_t legacy_cat_wrap_dim(
-    int64_t dim,
     const MaterializedITensorListRef& tensors) {
   for (const Tensor& tensor : tensors) {
-    if (tensor.dim() == 1 && tensor.sizes()[0] == 0) {
-      continue;
+    if (tensor.dim() == 1) {
+      if (TORCH_GUARD_OR_FALSE(tensor.sym_sizes()[0].sym_eq(0))) {
+        continue;
+      }
     }
     return maybe_wrap_dim(dim, tensor.dim());
   }
@@ -145,8 +148,8 @@ inline int64_t legacy_cat_wrap_dim(
 inline void wrap_all_dims(
     std::vector<int64_t>& dims_to_wrap,
     int64_t tensor_total_dims) {
-  for (const auto i : c10::irange(dims_to_wrap.size())) {
-    dims_to_wrap[i] = maybe_wrap_dim(dims_to_wrap[i], tensor_total_dims);
+  for (auto& dims_to_wrap_elem : dims_to_wrap) {
+    dims_to_wrap_elem = maybe_wrap_dim(dims_to_wrap_elem, tensor_total_dims);
   }
 }
 

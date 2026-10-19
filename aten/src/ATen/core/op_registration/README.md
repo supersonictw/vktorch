@@ -1,4 +1,4 @@
-# Howto: Writing PyTorch & Caffe2 Operators
+# Howto: Writing PyTorch Operators
 
 So you want to write a new operator or a new kernel for an existing operator. How do you do that and what API should you use? So glad you asked.
 
@@ -13,13 +13,13 @@ There’s four main use cases
 * You’re writing a new operator that isn’t supposed to be part of the public PyTorch API.
 * You’re writing a new operator but don’t want to change the core pytorch code base, say you’re developing a shared library with operators.
 * You’re writing a C++ extension for PyTorch or you’re using inline c++ in your .py model files.
-* You’re writing a backend library like XLA or ORT that adds new kernels to all operators defined in `native_functions.yaml`.
+* You’re writing a backend library like XLA or MAIA that adds new kernels to all operators defined in `native_functions.yaml`.
 
 For these use cases, the custom operator API is the better solution.
 
 ### What is the price for using the custom operator API instead of `native_functions.yaml`?
 
-If you’re just using the custom operator API to add new kernels for existing operators (e.g. the XLA/ORT example above), then you’re fine and don’t pay any price. If, however, you define a new operator purely using the custom op API, i.e. your operator never shows up in `native_functions.yaml`, then you need to be aware of a few caveats.
+If you’re just using the custom operator API to add new kernels for existing operators (e.g. the XLA/MAIA example above), then you’re fine and don’t pay any price. If, however, you define a new operator purely using the custom op API, i.e. your operator never shows up in `native_functions.yaml`, then you need to be aware of a few caveats.
 
 * It will not get a C++ API generated. There will not be `Tensor::your_op()` methods or `at::your_op()` functions to call your operator.
 * The API for calling the operator from Python looks a little bit different. It needs to be called through `torch.ops.your_op()` instead of `torch._C`.
@@ -140,7 +140,7 @@ Or with annotations:
 
 ```
 namespace {
-    Tensor my_kernel_cpu(const Tensor& a, int64_t b, at::optional<int64_t> c) {...}
+    Tensor my_kernel_cpu(const Tensor& a, int64_t b, std::optional<int64_t> c) {...}
 }
 
 static auto registry = torch::RegisterOperators()
@@ -174,13 +174,13 @@ The kernel function can take any of the following types as inputs or outputs:
 * `double` (note: `float` is not supported)
 * `int64_t` (note: other integer types like `int`, `uint64_t`, `int32_t`, `...` are not supported)
 * `bool`
-* `c10::string_view`
+* `std::string_view`
 * `at::Scalar` (this is a type that can hold either an integer or a floating point value)
-* `at::optional<T>` with T being any type from the list above
+* `std::optional<T>` with T being any type from the list above
 
 The kernel function can take and return list inputs by using `torch::List<T>`. `T` must be one of the supported types from above excluding `at::Scalar`.
 
-The kernel function can take and return dicts by using `torch::Dict<Key, Value>`. `Key` must be `int64_t`, `c10::string_view`, `double` or `bool`, and `Value` must be from the list of supported types above excluding `at::Scalar`.
+The kernel function can take and return dicts by using `torch::Dict<Key, Value>`. `Key` must be `int64_t`, `std::string_view`, `double` or `bool`, and `Value` must be from the list of supported types above excluding `at::Scalar`.
 
 When taken as input, any of these types can be taken by value (i.e. `Tensor`) or by const-reference (i.e. `const Tensor&`). We recommend taking all arguments by value, even Tensors. They will be moved in, so there is no performance overhead.
 
@@ -224,33 +224,4 @@ This is useful to define the interface of an operator when you don't know a kern
 
 ## Calling custom operators
 
-### From PyTorch/JIT
-
 All registered operators are automatically available to PyTorch and JIT under `torch.ops.XXX`. If your operator was `my_namespace::my_op`, you can call it from python or JIT using `torch.ops.my_namespace.my_op(a, b)`.
-
-### From caffe2
-
-Custom operators are not available to the caffe2 frontend by default, but there's a simple macro you can add if you want to make it available. To expose a CPU kernel:
-
-```
-// Expose "my_namespace::my_op" custom operator to caffe2.
-// In caffe2, the operator will be called "MyCaffe2OperatorName".
-C10_EXPORT_C10_OP_TO_CAFFE2_CPU(
-    MyCaffe2OperatorName, "my_namespace::my_op")
-```
-
-And to expose a CUDA kernel:
-
-```
-C10_EXPORT_C10_OP_TO_CAFFE2_CUDA(
-    MyCaffe2OperatorName, "my_namespace::my_op")
-```
-
-Note that this doesn't autogenerate a caffe2 operator schema for you (yet). If there's need, we might consider adding that in future, but for now you have to write the caffe2 `OPERATOR_SCHEMA` macro manually if you need it.
-
-Also, there's some requirements on the operator schema for it to be callable from caffe2. Some of these restrictions are just because the functionality isn't implemented. If you have a use case that is blocked by them, please reach out to Sebastian Messmer.
-
-* There must be either one or more arguments of type `Tensor`, or one argument of type `Tensor[]`. You cannot have both `Tensor` and `Tensor[]`.
-* Except for `Tensor` or `Tensor[]`, only arguments of type `int`, `double` and `bool` are supported. These can be in any position in the argument list and will be read from the caffe2 operator arguments, based on the argument name in the operator schema.
-* We do not support lists (`int[]`, `double[]` or `bool[]`) or optionals (`int?`, `double?`, `bool?`) yet.
-* The operator must return a single `Tensor` or multiple tensors as in `(Tensor, Tensor, Tensor)`. It cannot return a list `Tensor[]`, optional `Tensor?` or any primitive types.

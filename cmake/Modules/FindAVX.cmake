@@ -1,4 +1,5 @@
 INCLUDE(CheckCSourceRuns)
+INCLUDE(CheckCSourceCompiles)
 INCLUDE(CheckCXXSourceRuns)
 
 SET(AVX_CODE "
@@ -51,9 +52,9 @@ MACRO(CHECK_SSE lang type flags)
     IF(NOT ${lang}_${type}_FOUND)
       SET(CMAKE_REQUIRED_FLAGS ${__FLAG})
       IF(lang STREQUAL "CXX")
-        CHECK_CXX_SOURCE_RUNS("${${type}_CODE}" ${lang}_HAS_${type}_${__FLAG_I})
+        CHECK_CXX_SOURCE_COMPILES("${${type}_CODE}" ${lang}_HAS_${type}_${__FLAG_I})
       ELSE()
-        CHECK_C_SOURCE_RUNS("${${type}_CODE}" ${lang}_HAS_${type}_${__FLAG_I})
+        CHECK_C_SOURCE_COMPILES("${${type}_CODE}" ${lang}_HAS_${type}_${__FLAG_I})
       ENDIF()
       IF(${lang}_HAS_${type}_${__FLAG_I})
         SET(${lang}_${type}_FOUND TRUE CACHE BOOL "${lang} ${type} support")
@@ -73,10 +74,24 @@ MACRO(CHECK_SSE lang type flags)
 
 ENDMACRO()
 
-CHECK_SSE(C "AVX" " ;-mavx;/arch:AVX")
-CHECK_SSE(C "AVX2" " ;-mavx2 -mfma -mf16c;/arch:AVX2")
-CHECK_SSE(C "AVX512" " ;-mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma;/arch:AVX512")
+# MSVC exposes the intrinsics regardless of /arch:, so the no-op " " candidate
+# would win and leave *_FLAGS blank. Consumers that compile arch-specific
+# sources with those flags (fbgemm) then build without /arch:, and MSVC leaves
+# __AVX2__/__AVX512F__ undefined. Probe the real flag first.
+if(MSVC)
+  CHECK_SSE(C "AVX" "/arch:AVX")
+  CHECK_SSE(C "AVX2" "/arch:AVX2")
+  CHECK_SSE(C "AVX512" "/arch:AVX512")
 
-CHECK_SSE(CXX "AVX" " ;-mavx;/arch:AVX")
-CHECK_SSE(CXX "AVX2" " ;-mavx2 -mfma -mf16c;/arch:AVX2")
-CHECK_SSE(CXX "AVX512" " ;-mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma;/arch:AVX512")
+  CHECK_SSE(CXX "AVX" "/arch:AVX")
+  CHECK_SSE(CXX "AVX2" "/arch:AVX2")
+  CHECK_SSE(CXX "AVX512" "/arch:AVX512")
+else()
+  CHECK_SSE(C "AVX" " ;-mavx;/arch:AVX")
+  CHECK_SSE(C "AVX2" " ;-mavx2 -mfma -mf16c;/arch:AVX2")
+  CHECK_SSE(C "AVX512" " ;-mavx512f -mavx512dq -mavx512vl -mavx512bw -mavx512bf16 -mfma;/arch:AVX512")
+
+  CHECK_SSE(CXX "AVX" " ;-mavx;/arch:AVX")
+  CHECK_SSE(CXX "AVX2" " ;-mavx2 -mfma -mf16c;/arch:AVX2")
+  CHECK_SSE(CXX "AVX512" " ;-mavx512f -mavx512dq -mavx512vl -mavx512bw -mavx512bf16 -mfma;/arch:AVX512")
+endif()

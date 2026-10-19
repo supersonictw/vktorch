@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import gc
 import logging
 import os
@@ -8,8 +9,10 @@ import numpy
 
 import torch
 import torch.optim as optim
+from torch.utils._ordered_set import OrderedSet
 
 from .. import config
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -40,13 +43,13 @@ def clean_memory() -> None:
 # We compare the numerical results before and after pre/post grad fx passes
 # transformation to make sure the numerical results are the same.
 def compare_dict_tensors(dict_base, dict_control, precision):
-    if len(set(dict_base.keys())) != len(set(dict_control.keys())):
+    if len(OrderedSet(dict_base.keys())) != len(OrderedSet(dict_control.keys())):
         logger.warning("Mismatch keys found before and after pre/post grad fx passes.")
         logger.debug("keys before pre/post grad fx passes %s", dict_base.keys())
         logger.debug("keys after pre/post grad fx passes %s", dict_control.keys())
         return False
     is_allclose = True
-    for key in dict_base.keys():
+    for key in dict_base:
         if key not in dict_control:
             logger.warning(
                 "Mismatch parameter name %s does not exist after pre/post grad fx passes",
@@ -149,8 +152,8 @@ def run_model(
             _ = pred_control[0].sum().backward(retain_graph=True)
             res = compare_gradients(model_base, model_control, precision)
             logger.info("compare param grad. Numerical result : %s", res)
-        except Exception as e:
-            logger.exception("Exception %s when compare gradients", e)
+        except Exception:
+            logger.exception("Exception when comparing gradients")
             traceback.print_exc()
 
         if config.fx_passes_numeric_check["requires_optimizer"]:
@@ -170,9 +173,9 @@ def run_model(
                     "compare parameters with optimizer added. Numerical result : %s",
                     res,
                 )
-            except Exception as e:
+            except Exception:
                 logger.exception(
-                    "Exception %s when optimizer is added to check parameter names", e
+                    "Exception when optimizer is added to check parameter names"
                 )
                 traceback.print_exc()
         else:

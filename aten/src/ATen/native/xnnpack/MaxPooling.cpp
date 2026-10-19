@@ -184,8 +184,7 @@ Tensor max_pool2d(
             ceil_mode),
       },
       input_padded_contig_nhwc.options().dtype(),
-      MemoryFormat::ChannelsLast,
-      input_padded_contig_nhwc.opt_names());
+      MemoryFormat::ChannelsLast);
 
   xnn_operator_t max_pool_op{};
 
@@ -200,9 +199,6 @@ Tensor max_pool2d(
       parameters.stride[Layout::Parameter::width],                    // subsampling_width
       parameters.dilation[Layout::Parameter::height],                 // dilation_height
       parameters.dilation[Layout::Parameter::width],                  // dilation_width
-      input_padded_contig_nhwc.size(Layout::Activation4D::channels),  // channels
-      input_padded_contig_nhwc.size(Layout::Activation4D::channels),  // input_pixel_stride - NHWC Contiguous
-      output_padded_contig_nhwc.size(Layout::Activation4D::channels), // output_pixel_stride - NHWC Contiguous
       output_min,                                                     // output_min
       output_max,                                                     // output_max
       0u,                                                             // flags
@@ -215,13 +211,16 @@ Tensor max_pool2d(
       "xnn_create_max_pooling2d_nhwc_f32 failed!");
 
   const xnn_status reshape_status = xnn_reshape_max_pooling2d_nhwc_f32(
-      max_pool_op,                                                  // operator
-      input_padded_contig_nhwc.size(Layout::Activation4D::batch),   // batch_size
-      input_padded_contig_nhwc.size(Layout::Activation4D::height),  // input_height
-      input_padded_contig_nhwc.size(Layout::Activation4D::width),   // input_width
-      nullptr,                                                      // output_height_out
-      nullptr,                                                      // output_width_out
-      caffe2::pthreadpool_());                                      // threadpool
+      max_pool_op,                                                    // operator
+      input_padded_contig_nhwc.size(Layout::Activation4D::batch),     // batch_size
+      input_padded_contig_nhwc.size(Layout::Activation4D::height),    // input_height
+      input_padded_contig_nhwc.size(Layout::Activation4D::width),     // input_width
+      input_padded_contig_nhwc.size(Layout::Activation4D::channels),  // channels
+      input_padded_contig_nhwc.size(Layout::Activation4D::channels),  // input_pixel_stride - NHWC Contiguous
+      output_padded_contig_nhwc.size(Layout::Activation4D::channels), // output_pixel_stride - NHWC Contiguous
+      nullptr,                                                        // output_height_out
+      nullptr,                                                        // output_width_out
+      caffe2::pthreadpool_());                                        // threadpool
 
   TORCH_CHECK(
     xnn_status_success == reshape_status,
@@ -229,7 +228,7 @@ Tensor max_pool2d(
 
   const xnn_status setup_status = xnn_setup_max_pooling2d_nhwc_f32(
       max_pool_op,                                                  // operator
-      input_padded_contig_nhwc.data_ptr<float>(),                   // input
+      input_padded_contig_nhwc.const_data_ptr<float>(),                   // input
       output_padded_contig_nhwc.data_ptr<float>());                 // output
 
   TORCH_CHECK(
