@@ -70,6 +70,9 @@ jobs:
           # 推送同步分支到本專案
           git push -f origin ${{ env.SYNC_BRANCH }}
 
+          # 等待 GitHub API 索引最新推送的分支
+          sleep 5
+
       - name: Create or Update Pull Request
         if: steps.check_changes.outputs.has_changes == 'true'
         env:
@@ -77,6 +80,7 @@ jobs:
         run: |
           # 檢查是否已存在同名分支的開啟中 PR
           EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
             --base "${{ env.BASE_BRANCH }}" \
             --head "${{ env.SYNC_BRANCH }}" \
             --state open \
@@ -96,10 +100,14 @@ jobs:
 
           if [ -n "$EXISTING_PR" ]; then
             echo "Existing PR #$EXISTING_PR found. Updating..."
-            gh pr edit "$EXISTING_PR" --title "$PR_TITLE" --body "$PR_BODY"
+            gh pr edit "$EXISTING_PR" \
+              --repo "${{ github.repository }}" \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY"
           else
             echo "Creating a new Pull Request..."
             gh pr create \
+              --repo "${{ github.repository }}" \
               --base "${{ env.BASE_BRANCH }}" \
               --head "${{ env.SYNC_BRANCH }}" \
               --title "$PR_TITLE" \
