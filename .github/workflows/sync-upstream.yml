@@ -25,6 +25,7 @@ jobs:
         with:
           ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -39,9 +40,6 @@ jobs:
       - name: Check for New Commits & Prepare Branch
         id: check_changes
         run: |
-          # 記錄當前本地 main 的 commit hash
-          LOCAL_BASE_REF=$(git rev-parse HEAD)
-
           # 檢查上游相對於當前分支是否有新 commit
           NEW_COMMITS=$(git rev-list HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --count)
           echo "Found $NEW_COMMITS new commits from upstream."
@@ -69,21 +67,13 @@ jobs:
             echo "has_conflict=true" >> $GITHUB_OUTPUT
           fi
 
-          # GitHub Actions 預設 GITHUB_TOKEN 禁止推送修改 .github/workflows 的 commit
-          # 保留本地原本的 .github/workflows，避免權限被拒，同時防止上游大量的 CI 工作流在 fork 上被觸發
-          git checkout "$LOCAL_BASE_REF" -- .github/workflows/
-          if [ -n "$(git status --porcelain .github/workflows)" ]; then
-            git add .github/workflows
-            git commit -m "chore(sync): preserve local workflows" || true
-          fi
-
           # 推送同步分支到本專案
           git push -f origin ${{ env.SYNC_BRANCH }}
 
       - name: Create or Update Pull Request
         if: steps.check_changes.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           # 檢查是否已存在同名分支的開啟中 PR
           EXISTING_PR=$(gh pr list \
