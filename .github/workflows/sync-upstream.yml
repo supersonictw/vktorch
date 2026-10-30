@@ -1,0 +1,115 @@
+name: Sync Upstream & Create PR
+
+on:
+  schedule:
+    # 每天凌晨 04:00 (UTC) 自動檢查一次
+    - cron: '0 4 * * *'
+  workflow_dispatch: # 支援在 GitHub Actions 頁面手動點擊觸發
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: 'pytorch/pytorch'
+  UPSTREAM_BRANCH: 'main'
+  SYNC_BRANCH: 'sync/upstream'
+  BASE_BRANCH: 'main'
+
+jobs:
+  sync-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Check for New Commits & Prepare Branch
+        id: check_changes
+        run: |
+          # 檢查上游相對於當前分支是否有新 commit
+          NEW_COMMITS=$(git rev-list HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --count)
+          echo "Found $NEW_COMMITS new commits from upstream."
+
+          if [ "$NEW_COMMITS" -eq 0 ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "Already up-to-date with upstream."
+            exit 0
+          fi
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+
+          # 切換或建立專用的同步分支
+          git checkout -B ${{ env.SYNC_BRANCH }}
+
+          # 嘗試合併上游變更
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }}"; then
+            echo "Merge succeeded cleanly."
+            echo "has_conflict=false" >> $GITHUB_OUTPUT
+          else
+            echo "Merge conflict detected! Aborting merge."
+            git merge --abort
+            # 發生衝突時改用上游內容覆蓋同步分支，保留衝突處供 PR 人工處理
+            git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
+            echo "has_conflict=true" >> $GITHUB_OUTPUT
+          fi
+
+          # 推送同步分支到本專案
+          git push -f origin ${{ env.SYNC_BRANCH }}
+
+          # 等待 GitHub API 索引最新推送的分支
+          sleep 5
+
+      - name: Create or Update Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # 檢查是否已存在同名分支的開啟中 PR
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base "${{ env.BASE_BRANCH }}" \
+            --head "${{ env.SYNC_BRANCH }}" \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          PR_TITLE="chore(sync): update with upstream (${{ env.UPSTREAM_REPO }})"
+          PR_BODY="### 🔄 Upstream Synchronization Notice
+
+          自動從上游 \`${{ env.UPSTREAM_REPO }}:${{ env.UPSTREAM_BRANCH }}\` 檢測到新更新。
+
+          - **同步來源分支**：\`${{ env.SYNC_BRANCH }}\`
+          - **目標分支**：\`${{ env.BASE_BRANCH }}\`
+          - **是否有衝突覆蓋**：\`${{ steps.check_changes.outputs.has_conflict }}\`
+
+          > 💡 請審閱變更確認後進行 Merge。"
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Existing PR #$EXISTING_PR found. Updating..."
+            gh pr edit "$EXISTING_PR" \
+              --repo "${{ github.repository }}" \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY"
+          else
+            echo "Creating a new Pull Request..."
+            gh pr create \
+              --repo "${{ github.repository }}" \
+              --base "${{ env.BASE_BRANCH }}" \
+              --head "${{ env.SYNC_BRANCH }}" \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY"
+          fi
