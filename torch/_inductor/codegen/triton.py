@@ -62,6 +62,7 @@ from ..runtime import triton_heuristics
 from ..runtime.benchmarking import benchmarker
 from ..runtime.hints import (
     AutotuneHint,
+    DeviceProperties,
     get_warp_size,
     native_matmul_persistent_rblock,
     ReductionHint,
@@ -112,6 +113,7 @@ from ..utils import (
     sympy_subs,
     TMA_ALIGNMENT,
     TRITON_FLOAT8_DTYPES,
+    triton_fp_fusion_enabled,
     triton_type,
     triton_version_uses_attrs_dict,
     upcast_compute_type,
@@ -139,6 +141,7 @@ from .common import (
     WorkspaceZeroMode,
 )
 from .simd import (
+    apply_grid_split_kernel_kwargs,
     constant_repr,
     DerivedIterationRangesRoot,
     IterationRanges,
@@ -400,6 +403,12 @@ class TritonSymbols:
         )
 
 
+def _reduction_start_offset() -> sympy.Expr:
+    if V.kernel.split_as_grid_reduction is not None:
+        return sympy.Symbol("rsplit_start", integer=True, nonnegative=True)
+    return sympy.Integer(0)
+
+
 @dataclasses.dataclass
 class IndexingOptions:
     index_str: str
@@ -521,12 +530,17 @@ class BlockDescriptorOptions:
         # Compute the final shape, adjusting for special kernel types.
         final_shape = [TritonSymbols.get_block_size(tree) for tree in range_trees]
         if V.kernel.no_x_dim:
-            if range_trees[0].prefix != "x":
+            # x carries no tensor dim. It is not necessarily first: a split-as-grid
+            # kernel keeps y/z tensor dims for the dims it did not reduce.
+            x_positions = [
+                idx for idx, tree in enumerate(range_trees) if tree.prefix == "x"
+            ]
+            if len(x_positions) != 1:
                 raise AssertionError(
-                    f"expected first range tree prefix to be 'x', got "
-                    f"{range_trees[0].prefix!r}"
+                    f"expected exactly one 'x' range tree, got "
+                    f"{[tree.prefix for tree in range_trees]}"
                 )
-            final_shape.pop(0)
+            final_shape.pop(x_positions[0])
 
         # Check to see which of the final shape dimensions are included in this parameter
         # e.g. if block shape is [XBLOCK // 2, XBLOCK % 2], but the kernel shape
@@ -594,10 +608,11 @@ class BlockDescriptorOptions:
         return result
 
     def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
+        replacement = _reduction_start_offset()
         return sympy_subs(
             expr,
             {
-                TritonSymbols.get_block_offset_symbol(tree): sympy.S.Zero
+                TritonSymbols.get_block_offset_symbol(tree): replacement
                 for tree in V.kernel.range_trees
                 if tree.is_reduction
             },
@@ -3017,7 +3032,9 @@ class TMACompatibilityChecker:
         cached = self._gfx1250_cache
         if cached is not None and cached[0] == device:
             return cached[1]
-        capable = use_gfx1250_descriptor_codegen(device)
+        capable = self.kernel.tensor_descriptor_enabled and (
+            use_gfx1250_descriptor_codegen(device)
+        )
         self._gfx1250_cache = (device, capable)
         return capable
 
@@ -3032,7 +3049,7 @@ class TMACompatibilityChecker:
         device_type = device.type
         if device_type == "cpu":
             if not (
-                config.triton.use_tensor_descriptor
+                self.kernel.tensor_descriptor_enabled
                 and has_triton_cpu_backend()
                 and has_triton_stable_tma_api()
             ):
@@ -3065,7 +3082,7 @@ class TMACompatibilityChecker:
                 )
                 or device_type == "xpu"
             )
-            and config.triton.use_tensor_descriptor
+            and self.kernel.tensor_descriptor_enabled
             and has_triton_stable_tma_api()
         ):
             log.debug(
@@ -3077,9 +3094,8 @@ class TMACompatibilityChecker:
             )
             return False
 
-        # Strict multirow reductions are forced persistent and can settle on
-        # XBLOCK=1 after the initial TMA probe. Their output store must therefore
-        # use the scalar fallback rather than a 16-byte tensor descriptor.
+        # These all settle on XBLOCK=1, so the store cannot reach TMA's 16-byte
+        # minimum and must fall back off the tensor descriptor.
         if self.for_store and (
             self.kernel.no_x_dim or self.kernel.features.has_strict_multirow_reduction()
         ):
@@ -3611,6 +3627,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         hint_override: int | None = None,
         is_combo_kernel: bool = False,
         per_subkernel_blocks: bool = False,
+        override_tensor_descriptor: bool | None = None,
+        override_host_side_tma: bool | None = None,
         **kwargs,
     ) -> None:
         self.optimize_mask: bool = optimize_mask
@@ -3621,6 +3639,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._in_multi_kernel = False
         self._nvgemm_pdl_enabled = False
         self.per_subkernel_blocks: bool = per_subkernel_blocks
+        # None follows the global config; a bool pins this kernel to one side of the TMA choice.
+        self.override_tensor_descriptor = override_tensor_descriptor
+        self.override_host_side_tma = override_host_side_tma
         super().__init__(tiling, **kwargs)
         self.cse = TritonCSE(self.newvar_prefix, self.suffix)
         # Cache of values that can be reused for the prologue.
@@ -3649,6 +3670,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._host_tma_descriptor_buffers: dict[str, OrderedSet[str]] = {}
         self._device_tma_buffers: OrderedSet[str] = OrderedSet()
         self.hint_override = hint_override
+        # Set on mix-order split-size candidates: the benchmark module then also
+        # times the wrapper's finish of the partials (see
+        # codegen_benchmark_post_call). Maps split-reduction intermediates to
+        # the final outputs.
+        self.mix_order_benchmark_rename: dict[str, str] | None = None
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
         self._pdl_has_wait = False
@@ -3672,6 +3698,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.cooperative_reduction:
             self.init_cooperative_reduction()
 
+        self.init_split_as_grid_reduction()
+
         self.codegen_range_tree()
 
         if self.cooperative_reduction:
@@ -3694,6 +3722,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return any(
             not self._is_tma_buffer_removed(name) for name in self._device_tma_buffers
         )
+
+    @property
+    def tensor_descriptor_enabled(self) -> bool:
+        """Whether this kernel may emit tensor descriptors at all."""
+        if self.override_tensor_descriptor is not None:
+            return self.override_tensor_descriptor
+        return config.triton.use_tensor_descriptor
+
+    @property
+    def host_side_tma_enabled(self) -> bool:
+        """Whether this kernel prefers host-built descriptors over in-kernel ones."""
+        if self.override_host_side_tma is not None:
+            return self.override_host_side_tma
+        return config.triton.enable_host_side_tma
 
     def _is_tma_buffer_removed(self, name: str) -> bool:
         return any(
@@ -3963,7 +4005,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if isinstance(dim, sympy.Symbol):
                 continue
             return False
-        return True
+        # The launcher builds one descriptor per launch, so shape and strides may
+        # only depend on launch-time sizes, never on a range or loaded value.
+        size_symts = (SymT.SIZE, SymT.PRECOMPUTED_SIZE, SymT.UNBACKED_INT)
+        return all(
+            symbol_is_type(sym, size_symts)
+            for dim in (*indexing.shape, *indexing.strides)
+            for sym in sympy.sympify(dim).free_symbols
+        )
 
     def _can_materialize_host_tma(
         self,
@@ -3971,11 +4020,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing: TensorDescriptorOptions,
         dtype: torch.dtype,
     ) -> bool:
+        # Template epilogue accesses sit inside the persistent tile loop. With a
+        # zero constant offset the base is the bare kernel arg, indexing() has
+        # already rejected indirect indices, and _is_host_tma_materializable keeps
+        # shape/strides launch-invariant, so only the per-tile load/store offsets
+        # vary and one host-built descriptor is valid for every tile. The forced
+        # device path already relies on this when it lifts the same descriptor
+        # into the kernel prologue.
+        # Launch-time sizes are only wired up for template operands (see
+        # tma_descriptor's launch_args), so a template epilogue access with a
+        # dynamic dim keeps its in-kernel descriptor.
+        static_dims = all(
+            sympy.sympify(dim).is_number for dim in (*indexing.shape, *indexing.strides)
+        )
         return (
             has_triton_stable_tma_api()
-            and config.triton.enable_host_side_tma
-            and not indexing.can_lift
+            and self.host_side_tma_enabled
             and indexing.constant_offset == 0
+            and (static_dims or not indexing.can_lift)
             and var not in self._host_tma_non_materializable
             and self._is_host_tma_materializable(indexing, dtype)
         )
@@ -3983,7 +4045,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _prescan_host_tma_materializability(self) -> None:
         """Populate _host_tma_non_materializable_buffers with buffers that
         can't be expressed as a single host-side TMA descriptor."""
-        if not config.triton.use_tensor_descriptor:
+        if not self.tensor_descriptor_enabled:
             # Host TMA is off; mark as scanned (no bad buffers, won't change).
             self._host_tma_non_materializable_buffers = OrderedSet()
             return
@@ -4041,7 +4103,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         statically known to be a multiple of TMA_ALIGNMENT is treated as
         misaligned (conservative).
         """
-        if not config.triton.use_tensor_descriptor:
+        if not self.tensor_descriptor_enabled:
             return False
         if V.graph.get_current_device_or_throw().type != "cuda":
             return False
@@ -4117,6 +4179,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.body.writeline(
                 "rsplit_end = tl.where(rsplit_end < rnumel, rsplit_end, rnumel)"
             )
+
+    def init_split_as_grid_reduction(self):
+        """Emit per-program bounds for a split-as-grid reduction."""
+        split = self.split_as_grid_reduction
+        if split is None:
+            return
+        if not V.graph.sizevars.statically_known_equals(split, self.numels["x"]):
+            raise AssertionError("grid split factor must match the x dimension")
+        reduction_trees = [t for t in self.range_trees if t.is_reduction]
+        if len(reduction_trees) != 1:
+            raise AssertionError(
+                "split_as_grid_reduction requires exactly one reduction dimension, "
+                f"got {len(reduction_trees)}"
+            )
+        if not V.graph.sizevars.statically_known_equals(
+            reduction_trees[0].numel, self.features.reduction_numel
+        ):
+            raise AssertionError("grid split extent must match the reduction tree")
+        (x_tree,) = [t for t in self.range_trees if t.prefix == "x"]
+        self.body.splice(
+            f"""\
+            rsplit_id = {self.iteration_ranges_get_pid(x_tree)}
+            rsplit_chunk = (rnumel - 1) // {split} + 1
+            rsplit_start = rsplit_chunk * rsplit_id // RBLOCK * RBLOCK
+            rsplit_end = rsplit_chunk * (rsplit_id + 1)
+            rsplit_end = tl.where(rsplit_end < rnumel, rsplit_end, rnumel)
+            """,
+        )
 
     def init_cooperative_reduction_mask(self):
         rsplit_arange = "tl.arange(0, RSPLIT_NEXT_POWER_OF_2)"
@@ -4775,7 +4865,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # descriptor can be built on the host. Register it and return early --
             # no in-kernel tl.make_tensor_descriptor is emitted for it.
             if self._can_materialize_host_tma(var, indexing, V.graph.get_dtype(name)):
-                if var not in self.host_tma_descriptor_args:
+                if var in self.host_tma_descriptor_args:
+                    # A second consumer of an arg the template already described
+                    # would silently reuse the template's block shape.
+                    self._reject_if_template_host_tma(var)
+                else:
                     self.host_tma_descriptor_args[var] = indexing
                 self._host_tma_descriptor_buffers.setdefault(var, OrderedSet()).add(
                     name
@@ -4785,10 +4879,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # non-materializable and fall through to device-side TMA below.
             elif (
                 has_triton_stable_tma_api()
-                and config.triton.enable_host_side_tma
-                and not indexing.can_lift
+                and self.host_side_tma_enabled
                 and indexing.constant_offset != 0
             ):
+                # Reject before discarding: discarding first would drop a template
+                # operand's descriptor and leave its in-kernel uses uncompilable.
+                self._reject_if_template_host_tma(var)
                 self._host_tma_non_materializable.add(var)
                 self._discard_host_tma_descriptor(var)
 
@@ -5428,13 +5524,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         dtype = V.graph.get_dtype(name)
         uses_uint8_storage = use_uint8_triton_storage_for_cuda_float8_e4m3fn(dtype, var)
 
-        if config.triton.enable_host_side_tma:
+        if self.host_side_tma_enabled:
             if self._host_tma_non_materializable_buffers is None:
                 self._prescan_host_tma_materializability()
             if name in (self._host_tma_non_materializable_buffers or ()):
                 self._host_tma_non_materializable.add(var)
 
-        skip_tma = config.triton.enable_host_side_tma and self._check_buffer_alignment(
+        skip_tma = self.host_side_tma_enabled and self._check_buffer_alignment(
             name, var, dtype
         )
         tma_checker = (
@@ -7684,10 +7780,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             for level, tree in enumerate(loop_trees):
                 with self.body.indent(offset=level):
                     prefix = tree.prefix
-                    loop_start = "rsplit_start" if self.cooperative_reduction else "0"
-                    loop_end = (
-                        "rsplit_end" if self.cooperative_reduction else f"{prefix}numel"
+                    partitioned = (
+                        self.cooperative_reduction or self.split_as_grid_reduction
                     )
+                    loop_start = "rsplit_start" if partitioned else "0"
+                    loop_end = "rsplit_end" if partitioned else f"{prefix}numel"
                     # Conditionalize pipelining on HIP for Triton due to
                     # reports of numerical inaccuracies on older Triton
                     if torch.version.hip and get_triton_version() > (3, 2):
@@ -7893,6 +7990,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 result.writeline(
                     f"{str(Placeholder.KERNEL_NAME)}.run(*args, stream={stream_name})"
                 )
+                self.codegen_benchmark_post_call(result, call_args, signature)
 
         # benchmark all configs
         result.writelines(["\n", "\n", "def benchmark_all_configs(args):"])
@@ -7926,6 +8024,38 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
 
         return result
+
+    def codegen_benchmark_post_call(
+        self, result: IndentedBuffer, call_args: list[str], signature: list[Any]
+    ) -> None:
+        """Hook to emit code the benchmark times along with the kernel launch."""
+        if self.mix_order_benchmark_rename is None:
+            return
+        # Also time the wrapper's finish of the mix-order partials.
+        idx = next(
+            i for i, sig in enumerate(signature) if isinstance(sig, WorkspaceArg)
+        )
+
+        def hint(expr: sympy.Expr) -> str:
+            # Same hints as get_args, so the slices match the workspace.
+            return str(
+                V.graph.sizevars.optimization_hint_with_override(
+                    expr, hint_override=self.hint_override
+                )
+            )
+
+        nsplit = hint((self.numels["x"] + self.rsplit_size - 1) // self.rsplit_size)
+        for buffer_name, reduced in self.mix_order_partial_finishes(
+            f"args[{idx}]",
+            nsplit,
+            hint(self.numels["r0_"]),
+            self.mix_order_benchmark_rename,
+        ):
+            # Like the wrapper, cast the fp32 workspace to the output dtype
+            # (its trailing .view() to the output shape is free).
+            if (dtype := V.graph.get_dtype(buffer_name)) != torch.float:
+                reduced += f".to({dtype})"
+            result.writeline(reduced)
 
     def imports_for_benchmark_kernel(self):
         # Dedent BEFORE substituting get_raw_stream: a multi-line override would
@@ -8006,9 +8136,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     @classmethod
     def triton_meta_common(cls) -> TritonMeta:
         return {
-            "enable_fp_fusion": (
-                config.triton.enable_fp_fusion and not config.emulate_precision_casts
-            ),
+            "enable_fp_fusion": triton_fp_fusion_enabled(),
             "launch_pdl": cls._enable_pdl_codegen(),
             "disable_ftz": config.eager_numerics.disable_ftz,
         }
@@ -8038,6 +8166,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         }
 
         if config.incremental_autotune:
+            if config.incremental_autotune_reduction:
+                inductor_meta["incremental_autotune_reduction"] = True
             inductor_meta["incremental_autotune_max_dispatches"] = (
                 config.incremental_autotune_max_dispatches
             )
@@ -8141,6 +8271,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         return out
 
+    def body_fixed_blocks(self, sig_arg_names: OrderedSet[str]) -> dict[str, int]:
+        """Blocks defined in the kernel body rather than passed as a kernel arg."""
+        fixed_blocks: dict[str, int] = {}
+        if self.persistent_reduction:
+            for rt in self.range_trees:
+                if rt.is_reduction:
+                    block_name = f"{rt.prefix.upper()}BLOCK"
+                    if block_name not in sig_arg_names:
+                        try:
+                            val = self._get_persistent_reduction_block(rt.numel)
+                            if self.is_native_matmul:
+                                val = max(val, 16)
+                            fixed_blocks[block_name] = val
+                        except (TypeError, ValueError):
+                            pass
+        return fixed_blocks
+
     def resolved_host_tma_descriptor_args(
         self,
         descriptor_args: dict[str, TensorDescriptorOptions | dict[str, Any]]
@@ -8156,19 +8303,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         sig_arg_names = OrderedSet(
             arg.name for arg in signature if hasattr(arg, "name")
         )
-        fixed_blocks: dict[str, int] = {}
-        if self.persistent_reduction:
-            for rt in self.range_trees:
-                if rt.is_reduction:
-                    block_name = f"{rt.prefix.upper()}BLOCK"
-                    if block_name not in sig_arg_names:
-                        try:
-                            val = self._get_persistent_reduction_block(rt.numel)
-                            if self.is_native_matmul:
-                                val = max(val, 16)
-                            fixed_blocks[block_name] = val
-                        except (TypeError, ValueError):
-                            pass
+        fixed_blocks = self.body_fixed_blocks(sig_arg_names)
 
         def _resolve_block_dim(s):
             s_str = str(s)
@@ -8187,6 +8322,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             except (TypeError, ValueError):
                 return str(s)
 
+        output_args = OrderedSet(
+            v for v in self.args.output_buffers.values() if isinstance(v, str)
+        ) | OrderedSet(
+            b.inner_name
+            for b in self.args.inplace_buffers.values()
+            if isinstance(b, InplacedBuffer)
+        )
         resolved = {}
         for inner, opts in (
             self.host_tma_descriptor_args
@@ -8201,6 +8343,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 "shape": [_resolve_tensor_dim(s) for s in opts.shape],
                 "strides": [_resolve_tensor_dim(s) for s in opts.strides],
             }
+            if inner in output_args:
+                resolved[inner]["is_output"] = True
         return resolved
 
     @functools.cached_property
@@ -8446,6 +8590,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # TMA probing sets tma_min_block_sizes even when the access falls
             # back to tl.load; a stale constraint regresses non-TMA kernels.
             self.inductor_meta.pop("tma_min_block_sizes", None)
+        elif self.override_tensor_descriptor:
+            # Only the baseline gets max-autotune's search and coordinate descent; a pooled TMA variant is not tuned.
+            self.inductor_meta.update(
+                max_autotune=False,
+                max_autotune_pointwise=False,
+                max_autotune_reduction=False,
+                coordinate_descent_tuning=False,
+                tma_variant=True,
+            )
 
         self._filter_pdl(self.body)
 
@@ -9272,14 +9425,14 @@ class TritonScheduling(SIMDScheduling):
         # (keyed on the exact string) hits at wrapper time instead of compiling the
         # kernel twice and overwriting the same cache file.
         src_code = "\n" + textwrap.dedent(src_code).strip() + "\n"
+        optional = isinstance(kernel, SIMDKernel) and kernel.optional
         if (
-            not wrapper.defines_triton_kernels_as_code()
-            and async_compile.use_process_pool()
-        ):
+            optional or not wrapper.defines_triton_kernels_as_code()
+        ) and async_compile.use_process_pool():
             # The process pool is warm, we can shell out to workers right away. This
             # allows us to save the result in async_compile.CompiledTritonKernels,
             # so that the second time we call async_compile.triton, we do no work.
-            async_compile.triton(subs_name, src_code)
+            async_compile.triton(subs_name, src_code, optional=optional)
 
         # compile-on-one-rank: the artifact may be built on one machine and run on
         # another, so the wrapper must not embed an absolute cache path (it carries the
@@ -9303,6 +9456,7 @@ class TritonScheduling(SIMDScheduling):
             pin_config=not isinstance(
                 kernel, torch._inductor.select_algorithm.TritonTemplateKernel
             ),
+            optional=optional,
         )
 
     def define_kernel(self, src_code, node_schedule, kernel):
@@ -9479,6 +9633,8 @@ class TritonScheduling(SIMDScheduling):
         kernel_features: SIMDKernelFeatures,
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
+        *,
+        allow_tma_variants: bool = False,
     ) -> list[TritonKernel]:
         is_scan = kernel_features.contains_op("scan")
         is_split_scan = is_scan and any(
@@ -9499,8 +9655,93 @@ class TritonScheduling(SIMDScheduling):
         kernel_kwargs = V.choices.triton_kernel_kwargs(
             kernel_type, kernel_features, kernel_args, kernel_kwargs
         )
+        apply_grid_split_kernel_kwargs(kernel_features, kernel_kwargs)
+        pins = self.tensor_descriptor_variant_pins(
+            DeviceProperties.create(V.graph.get_current_device_or_throw())
+        )
+        if pins:
+            from .nv_universal_gemm.nv_universal_gemm_scheduling import (
+                NVUniversalGemmScheduling,
+            )
+
+            # Every unmeasured kernel keeps pointer loads, including a multi_kernel pool built below.
+            kernel_kwargs = {**kernel_kwargs, **pins[0]}
+            previous_nodes = V.graph.scheduler.previous_nodes
+            # Callers that keep one choice, such as mix-order reductions, and scans get no pool; host descriptors cannot materialize dynamic shapes.
+            # A kernel right after a PDL-enabled NVGEMM may launch with selective PDL, which no MultiKernel choice takes.
+            if (
+                not allow_tma_variants
+                or is_scan
+                or kernel_features.numel.free_symbols
+                or kernel_features.reduction_numel.free_symbols
+                # better-benchmark on H100 and GB200 measured no TMA win at 2**23 elements or fewer, where picks follow timing noise.
+                or V.graph.sizevars.statically_known_leq(
+                    kernel_features.numel * kernel_features.reduction_numel, 2**23
+                )
+                or (
+                    previous_nodes is not None
+                    and NVUniversalGemmScheduling.is_pdl_enabled_template(
+                        previous_nodes[-1]
+                    )
+                )
+            ):
+                pins = []
         kernel = kernel_type(*kernel_args, **kernel_kwargs)
-        return self.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
+        choices = self.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
+        # A multi_kernel pool was asked for explicitly.
+        if len(choices) > 1 or not pins:
+            return choices
+        # The pinned choices replace that kernel, which Kernel.__init__ already counted.
+        metrics.generated_kernel_count -= 1
+        choices = [
+            kernel_type(*kernel_args, **{**kernel_kwargs, **pin}) for pin in pins
+        ]
+        for choice in choices:
+            choice._in_multi_kernel = True
+        for choice in choices[1:]:
+            choice.optional = True
+            # Shared, not copied: it fills during codegen, and MultiKernel needs identical call args.
+            choice.must_keep_buffers = choices[0].must_keep_buffers
+        return choices
+
+    @staticmethod
+    def tensor_descriptor_variant_pins(
+        device_props: DeviceProperties,
+    ) -> list[dict[str, bool]]:
+        """TMA settings pinned on each choice of a pool, the non-TMA baseline first, or [] for no pool."""
+        pool = config.triton.autotune_tensor_descriptor
+        if (
+            pool not in ("auto", "all")
+            or not config.triton.use_tensor_descriptor
+            or not (config.max_autotune or config.max_autotune_pointwise)
+            or not has_triton_stable_tma_api()
+            or device_props.type != "cuda"
+            or (
+                device_props.major is None
+                or device_props.major < 9
+                or not config.assume_aligned_inputs
+            )
+            # Picking by measured time is what these forbid.
+            or config.deterministic
+            or torch.are_deterministic_algorithms_enabled()
+            or config.batch_invariant
+            # These force a sub-kernel by index into multi_kernel's own order.
+            or config.triton.multi_kernel > 1
+            # These wrappers do not support runtime multi-kernel dispatch.
+            or config.cpp_wrapper
+            or config.fx_wrapper
+        ):
+            return []
+        # Device-side TMA is opt-in: #187175 and #188823 measure it behind the baseline everywhere.
+        pins = [
+            {"override_tensor_descriptor": False},
+            {"override_tensor_descriptor": True, "override_host_side_tma": True},
+        ]
+        if pool == "all":
+            pins.append(
+                {"override_tensor_descriptor": True, "override_host_side_tma": False}
+            )
+        return pins
 
     def add_multi_kernel_choices(
         self,
