@@ -35,7 +35,6 @@ TEST(XPUDeviceTest, DeviceProperties) {
   EXPECT_TRUE(device_prop.max_compute_units > 0);
   EXPECT_TRUE(device_prop.gpu_eu_count > 0);
 
-#if SYCL_COMPILER_VERSION >= 20260100
   EXPECT_TRUE(device_prop.xe_stack_count > 0);
   EXPECT_TRUE(device_prop.xe_regions_per_stack > 0);
   EXPECT_TRUE(device_prop.xe_clusters_per_region > 0);
@@ -48,7 +47,6 @@ TEST(XPUDeviceTest, DeviceProperties) {
   auto max_subgroup_size = *std::max_element(
       device_prop.sub_group_sizes.begin(), device_prop.sub_group_sizes.end());
   EXPECT_EQ(device_prop.max_lanes_per_hw_thread, max_subgroup_size);
-#endif
 }
 
 TEST(XPUDeviceTest, PointerGetDevice) {
@@ -57,11 +55,18 @@ TEST(XPUDeviceTest, PointerGetDevice) {
   }
 
   sycl::device& raw_device = c10::xpu::get_raw_device(0);
-  void* ptr =
-      sycl::malloc_device(8, raw_device, c10::xpu::get_device_context());
+  sycl::context& context = c10::xpu::get_device_context();
+  void* ptr = sycl::malloc_device(8, raw_device, context);
 
   EXPECT_EQ(c10::xpu::get_device_idx_from_pointer(ptr), 0);
-  sycl::free(ptr, c10::xpu::get_device_context());
+  sycl::free(ptr, context);
+
+  ptr = sycl::malloc_host(8, context);
+  // Host USM isn't bound to a device; which index is reported is up to
+  // implementation.
+  auto device_index = c10::xpu::get_device_idx_from_pointer(ptr);
+  EXPECT_TRUE(device_index >= 0 && device_index < c10::xpu::device_count());
+  sycl::free(ptr, context);
 
   int dummy = 0;
   ASSERT_THROW(c10::xpu::get_device_idx_from_pointer(&dummy), c10::Error);
